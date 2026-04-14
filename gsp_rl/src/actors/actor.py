@@ -574,6 +574,45 @@ class Actor(NetworkAids):
                 self.gsp_networks['target_critic_2'].load_checkpoint(path, self.gsp)
         
     
+    def save_gsp_head_snapshot(self, path: str) -> None:
+        """Save ONLY the GSP prediction network's weights to `path`.
+
+        Lightweight snapshot used by the training loop to capture intermediate
+        GSP-head states for post-hoc best-checkpoint selection. Unlike save_model
+        this writes a single file and does not touch the main actor/critic.
+
+        No-op if GSP is disabled.
+        """
+        if not self.gsp or self.gsp_networks is None:
+            return
+        if self.gsp_networks.get('learning_scheme') == 'attention':
+            net = self.gsp_networks.get('attention')
+        else:
+            net = self.gsp_networks.get('actor')
+        if net is None:
+            return
+        T.save(net.state_dict(), path)
+
+    def load_gsp_head_snapshot(self, path: str) -> None:
+        """Load GSP-head weights previously saved by save_gsp_head_snapshot.
+
+        Restores the primary GSP network (actor or attention) from `path`.
+        The target_actor is left alone — this is intended for frozen test-phase
+        evaluation, not resumed training.
+        """
+        if not self.gsp or self.gsp_networks is None:
+            return
+        if self.gsp_networks.get('learning_scheme') == 'attention':
+            net = self.gsp_networks.get('attention')
+        else:
+            net = self.gsp_networks.get('actor')
+        if net is None:
+            return
+        device = next(net.parameters()).device
+        state = T.load(path, map_location=device)
+        net.load_state_dict(state)
+
+
 if __name__=='__main__':
     agent_args = {'id':1, 'input_size':32, 'output_size':2, 'options_per_action':3, 'n_agents':1, 'n_chars':2, 'meta_param_size':2, 
                  'gsp':False, 'recurrent_gsp':False, 'gsp_look_back':2}
