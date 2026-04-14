@@ -101,6 +101,8 @@ class Actor(NetworkAids):
         # Trunk capacity knobs — affect only the GSP head's MLP hidden layers.
         self.gsp_fc1_dims = int(config.get('GSP_FC1_DIMS', 400))
         self.gsp_fc2_dims = int(config.get('GSP_FC2_DIMS', 300))
+        # Task 4: LayerNorm trunk placement on the GSP head. Default False preserves legacy.
+        self.gsp_use_layer_norm = bool(config.get('GSP_USE_LAYER_NORM', False))
 
         self.recurrent_hidden_size = recurrent_hidden_size
         self.recurrent_embedding_size = recurrent_embedding_size
@@ -316,6 +318,9 @@ class Actor(NetworkAids):
             # collapse hypothesis identified in the 2026-04-14 trajectory deep-dive.
             'fc1_dims': getattr(self, 'gsp_fc1_dims', 400),
             'fc2_dims': getattr(self, 'gsp_fc2_dims', 300),
+            # Task 4: LayerNorm in the GSP head trunk. Placement: after fc1 and fc2,
+            # before each ReLU. Default False preserves legacy.
+            'use_layer_norm': getattr(self, 'gsp_use_layer_norm', False),
         }
         critic_nn_args = {
             'id':self.id,

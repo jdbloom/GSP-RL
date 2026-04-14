@@ -53,6 +53,7 @@ class DDPGActorNetwork(nn.Module):
             min_max_action: float = 1.0,
             weight_decay: float = 1e-4,
             init_w: float = 3e-3,
+            use_layer_norm: bool = False,
     ) -> None:
         """Initialize DDPG actor network.
 
@@ -69,6 +70,13 @@ class DDPGActorNetwork(nn.Module):
                 set to 0 in the GSP-head ablation to test the decoupled-decay hypothesis.
             init_w: Output layer weight init half-range. Default 3e-3 preserves legacy;
                 override (e.g. 0.1) in the GSP-head ablation to escape the pull-to-mean mode.
+            use_layer_norm: If True, insert LayerNorm after fc1 and fc2 (before each
+                ReLU). Defaults to False (legacy). Enabled as Task 4 of the stability
+                plan — LayerNorm in the trunk is the highest-evidence plasticity
+                stabilizer in recent off-policy RL (Lyle et al. NeurIPS 2024, BRO 2024).
+                Placement is the trunk (not pre-tanh) because the failure mode identified
+                in the ddpg-vs-attention analysis is a dead-ReLU cascade, not an
+                output-layer issue.
         """
         super().__init__()
 
@@ -78,10 +86,15 @@ class DDPGActorNetwork(nn.Module):
         self.lr = lr
         self.fc1_dims = fc1_dims
         self.fc2_dims = fc2_dims
+        self.use_layer_norm = use_layer_norm
 
         self.fc1 = nn.Linear(input_size, self.fc1_dims)
         self.fc2 = nn.Linear(self.fc1_dims, self.fc2_dims)
         self.mu = nn.Linear(self.fc2_dims, output_size)
+
+        if self.use_layer_norm:
+            self.ln1 = nn.LayerNorm(self.fc1_dims)
+            self.ln2 = nn.LayerNorm(self.fc2_dims)
 
         self.relu = nn.ReLU()
         self.tanh = nn.Tanh()
@@ -111,8 +124,12 @@ class DDPGActorNetwork(nn.Module):
             Action tensor of shape (*, output_size), bounded by min_max_action.
         """
         prob = self.fc1(x)
+        if self.use_layer_norm:
+            prob = self.ln1(prob)
         prob = self.relu(prob)
         prob = self.fc2(prob)
+        if self.use_layer_norm:
+            prob = self.ln2(prob)
         prob = self.relu(prob)
         mu = self.mu(prob)
         mu = self.min_max_action*self.tanh(mu)
