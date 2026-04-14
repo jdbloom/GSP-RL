@@ -98,6 +98,9 @@ class Actor(NetworkAids):
         # Read from the agent_config.yml so experiments can flip these per-job.
         self.gsp_weight_decay = float(config.get('GSP_WEIGHT_DECAY', 1e-4))
         self.gsp_init_w = float(config.get('GSP_INIT_W', 3e-3))
+        # Trunk capacity knobs — affect only the GSP head's MLP hidden layers.
+        self.gsp_fc1_dims = int(config.get('GSP_FC1_DIMS', 400))
+        self.gsp_fc2_dims = int(config.get('GSP_FC2_DIMS', 300))
 
         self.recurrent_hidden_size = recurrent_hidden_size
         self.recurrent_embedding_size = recurrent_embedding_size
@@ -309,6 +312,10 @@ class Actor(NetworkAids):
             # unchanged because it constructs its own actor_nn_args without these keys.
             'weight_decay': getattr(self, 'gsp_weight_decay', 1e-4),
             'init_w': getattr(self, 'gsp_init_w', 3e-3),
+            # Trunk capacity — wider MLP for the GSP head to test the feature-learning
+            # collapse hypothesis identified in the 2026-04-14 trajectory deep-dive.
+            'fc1_dims': getattr(self, 'gsp_fc1_dims', 400),
+            'fc2_dims': getattr(self, 'gsp_fc2_dims', 300),
         }
         critic_nn_args = {
             'id':self.id,
