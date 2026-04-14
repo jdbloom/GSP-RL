@@ -94,6 +94,11 @@ class Actor(NetworkAids):
         self.gsp_look_back = gsp_look_back
         self.gsp_sequence_length = gsp_sequence_length
 
+        # Task 0 ablation knobs for the GSP head. Defaults preserve legacy behavior.
+        # Read from the agent_config.yml so experiments can flip these per-job.
+        self.gsp_weight_decay = float(config.get('GSP_WEIGHT_DECAY', 1e-4))
+        self.gsp_init_w = float(config.get('GSP_INIT_W', 3e-3))
+
         self.recurrent_hidden_size = recurrent_hidden_size
         self.recurrent_embedding_size = recurrent_embedding_size
         self.recurrent_num_layers = recurrent_num_layers
@@ -297,7 +302,13 @@ class Actor(NetworkAids):
             'input_size':self.gsp_network_input,
             'output_size':self.gsp_network_output,
             'lr': self.lr,
-            'min_max_action':self.min_max_action
+            'min_max_action':self.min_max_action,
+            # Task 0 ablation knobs — defaults preserve legacy behavior exactly.
+            # Only the GSP-head actor network receives these; the main policy actor
+            # path (make_DDPG_networks called from e.g. Main.py algorithm setup) is
+            # unchanged because it constructs its own actor_nn_args without these keys.
+            'weight_decay': getattr(self, 'gsp_weight_decay', 1e-4),
+            'init_w': getattr(self, 'gsp_init_w', 3e-3),
         }
         critic_nn_args = {
             'id':self.id,

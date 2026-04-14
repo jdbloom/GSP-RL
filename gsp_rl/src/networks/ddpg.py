@@ -50,7 +50,9 @@ class DDPGActorNetwork(nn.Module):
             fc1_dims: int = 400,
             fc2_dims: int = 300,
             name: str = "DDPG_Actor",
-            min_max_action: float = 1.0
+            min_max_action: float = 1.0,
+            weight_decay: float = 1e-4,
+            init_w: float = 3e-3,
     ) -> None:
         """Initialize DDPG actor network.
 
@@ -63,6 +65,10 @@ class DDPGActorNetwork(nn.Module):
             fc2_dims: Second hidden layer width.
             name: Base name for checkpoint files.
             min_max_action: Tanh output scaling factor.
+            weight_decay: Adam weight decay. Default 1e-4 preserves legacy behavior;
+                set to 0 in the GSP-head ablation to test the decoupled-decay hypothesis.
+            init_w: Output layer weight init half-range. Default 3e-3 preserves legacy;
+                override (e.g. 0.1) in the GSP-head ablation to escape the pull-to-mean mode.
         """
         super().__init__()
 
@@ -80,9 +86,9 @@ class DDPGActorNetwork(nn.Module):
         self.relu = nn.ReLU()
         self.tanh = nn.Tanh()
 
-        self.init_weights(3e-3)
+        self.init_weights(init_w)
 
-        self.optimizer = optim.Adam(self.parameters(), lr = lr, weight_decay = 1e-4)
+        self.optimizer = optim.Adam(self.parameters(), lr = lr, weight_decay = weight_decay)
 
         self.name = name+'_'+str(id)+'_DDPG'
 
