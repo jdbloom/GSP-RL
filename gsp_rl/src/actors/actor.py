@@ -103,6 +103,13 @@ class Actor(NetworkAids):
         self.gsp_fc2_dims = int(config.get('GSP_FC2_DIMS', 300))
         # Task 4: LayerNorm trunk placement on the GSP head. Default False preserves legacy.
         self.gsp_use_layer_norm = bool(config.get('GSP_USE_LAYER_NORM', False))
+        # Task 5: VICReg variance+covariance penalty on the GSP head penultimate features.
+        # Default disabled. var_coef 1.0 and cov_coef 0.04 follow VICReg paper Table 9;
+        # target_std is derived dynamically from label batch std in learn_gsp_mse.
+        # See docs/research/gsp-hypothesis-tracker.md H-05 for rationale.
+        self.gsp_vicreg_enabled = bool(config.get('GSP_VICREG_ENABLED', False))
+        self.gsp_vicreg_var_coef = float(config.get('GSP_VICREG_VAR_COEF', 1.0))
+        self.gsp_vicreg_cov_coef = float(config.get('GSP_VICREG_COV_COEF', 0.04))
 
         self.recurrent_hidden_size = recurrent_hidden_size
         self.recurrent_embedding_size = recurrent_embedding_size

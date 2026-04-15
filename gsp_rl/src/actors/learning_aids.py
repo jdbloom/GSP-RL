@@ -47,6 +47,50 @@ def _check_nan(value, name):
 Loss = nn.MSELoss()
 
 
+def vicreg_variance_loss(h: T.Tensor, target_std: float = 1.0, eps: float = 1e-4) -> T.Tensor:
+    """VICReg variance term — hinge loss keeping per-dim std >= target_std.
+
+    Part of Task 5 (Bardes, Ponce, LeCun ICLR 2022, arxiv 2105.04906).
+    For a feature batch of shape (batch, D), computes std along batch dim for
+    each of D features and penalizes those below target_std. Forces the
+    representation to have a variance floor, attacking dimensional collapse.
+
+    Args:
+        h: Feature tensor of shape (batch, D).
+        target_std: Minimum acceptable per-dim std. VICReg paper uses 1.0 but
+            for scale-aware application in MSE regression we pass the running
+            label std estimate to avoid saturating the tanh output.
+        eps: Numerical floor for the std calculation.
+
+    Returns:
+        Scalar tensor loss. Zero when all dims already satisfy std >= target_std.
+    """
+    std = T.sqrt(h.var(dim=0) + eps)
+    return T.mean(F.relu(target_std - std))
+
+
+def vicreg_covariance_loss(h: T.Tensor) -> T.Tensor:
+    """VICReg covariance term — off-diagonal penalty on the feature covariance.
+
+    Part of Task 5 (Bardes, Ponce, LeCun ICLR 2022).
+    Decorrelates feature dimensions by penalizing off-diagonal elements of the
+    batch-wise covariance matrix. Normalized by D to make the coefficient
+    approximately scale-independent across feature widths.
+
+    Args:
+        h: Feature tensor of shape (batch, D).
+
+    Returns:
+        Scalar tensor loss. Zero when features are perfectly decorrelated.
+    """
+    N, D = h.shape
+    h_centered = h - h.mean(dim=0, keepdim=True)
+    cov = (h_centered.T @ h_centered) / max(N - 1, 1)
+    # Zero out the diagonal, sum of squares on off-diagonal, divide by D
+    off_diag = cov - T.diag(T.diagonal(cov))
+    return (off_diag ** 2).sum() / D
+
+
 class Hyperparameters:
     """Configuration container loaded from a YAML config dict.
 
@@ -488,9 +532,25 @@ class NetworkAids(Hyperparameters):
         Direct supervised MSE has a non-vanishing gradient `2(pred-label)` that
         drives the predictor toward the label regardless of how flat the reward
         landscape is.
+
+        Task 5: Optional VICReg variance+covariance penalty on the penultimate
+        feature vector (Bardes, Ponce, LeCun ICLR 2022). Guarded by
+        self.gsp_vicreg_enabled (default False). When enabled, this ADDS two
+        loss terms to the MSE loss targeting dimensional collapse of the
+        encoder features — the failure mode that LayerNorm alone only
+        partially addresses for MSE regression aux heads (Lyle 2024 +
+        literature review 2026-04-15).
+
+        Design notes (from the red-team audit):
+        - target_std is scale-aware: defaults to running estimate of label std
+          to avoid mismatched-scale saturation of the variance hinge
+        - covariance coefficient normalized by feature dim
+        - variance hinge: F.relu(target_std - pred_std).mean()
         """
         if networks['replay'].mem_ctr < self.gsp_batch_size:
             return None
+
+        vicreg_enabled = getattr(self, 'gsp_vicreg_enabled', False)
 
         if recurrent:
             mem_result = self.sample_memory(networks)
@@ -505,17 +565,38 @@ class NetworkAids(Hyperparameters):
                 labels_shaped = labels.unsqueeze(-1)
             else:
                 labels_shaped = labels.view_as(preds)
-            loss = F.mse_loss(preds, labels_shaped)
+            mse_loss = F.mse_loss(preds, labels_shaped)
+            # VICReg not yet supported for recurrent path (RDDPGActorNetwork
+            # forward signature differs — would require a separate feature
+            # extraction hook). Only apply to non-recurrent for now.
+            loss = mse_loss
         else:
             states, labels, _, _, _ = self.sample_memory(networks)
             networks['actor'].optimizer.zero_grad()
-            preds = networks['actor'].forward(states)
+            if vicreg_enabled:
+                preds, features = networks['actor'].forward(states, return_features=True)
+            else:
+                preds = networks['actor'].forward(states)
+                features = None
             # labels shape: (batch,) or (batch, 1). preds shape: (batch, 1).
             if labels.dim() == preds.dim() - 1:
                 labels_shaped = labels.unsqueeze(-1)
             else:
                 labels_shaped = labels.view_as(preds)
-            loss = F.mse_loss(preds, labels_shaped)
+            mse_loss = F.mse_loss(preds, labels_shaped)
+            loss = mse_loss
+
+            if vicreg_enabled and features is not None:
+                var_coef = float(getattr(self, 'gsp_vicreg_var_coef', 1.0))
+                cov_coef = float(getattr(self, 'gsp_vicreg_cov_coef', 0.04))
+                # Scale-aware target_std: match the batch's label std so the
+                # variance hinge doesn't force features to saturate the
+                # downstream tanh head. Clamp to >= 0.01 for numerical safety.
+                with T.no_grad():
+                    label_std = float(labels_shaped.std().clamp(min=0.01).item())
+                var_loss = vicreg_variance_loss(features, target_std=label_std)
+                cov_loss = vicreg_covariance_loss(features)
+                loss = mse_loss + var_coef * var_loss + cov_coef * cov_loss
 
         loss.backward()
         _check_nan(loss, f"GSP MSE loss at step {networks['learn_step_counter']}")

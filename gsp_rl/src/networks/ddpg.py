@@ -114,14 +114,22 @@ class DDPGActorNetwork(nn.Module):
         self.fc2.weight.data = fanin_init(self.fc2.weight.data.size())
         self.mu.weight.data.uniform_(-init_w, init_w)
 
-    def forward(self, x: T.Tensor) -> T.Tensor:
+    def forward(self, x: T.Tensor, return_features: bool = False):
         """Compute deterministic action given state.
 
         Args:
             x: State tensor of shape (*, input_size).
+            return_features: If True, returns (action, penultimate_features) tuple
+                where penultimate_features is the post-ReLU activation of fc2 —
+                the feature vector immediately before the output linear.
+                This is the tensor targeted by VICReg variance+covariance
+                regularization for Task 5 of the stability plan. Default False
+                preserves the legacy Tensor-only return.
 
         Returns:
             Action tensor of shape (*, output_size), bounded by min_max_action.
+            If return_features: (action, features) where features has shape
+            (*, fc2_dims).
         """
         prob = self.fc1(x)
         if self.use_layer_norm:
@@ -131,8 +139,11 @@ class DDPGActorNetwork(nn.Module):
         if self.use_layer_norm:
             prob = self.ln2(prob)
         prob = self.relu(prob)
+        penultimate = prob  # post-ReLU activation at fc2 is the "features" VICReg regularizes
         mu = self.mu(prob)
         mu = self.min_max_action*self.tanh(mu)
+        if return_features:
+            return mu, penultimate
         return mu
 
     def save_checkpoint(self, path: str, intention=False) -> None:
