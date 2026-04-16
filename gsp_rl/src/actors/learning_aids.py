@@ -337,6 +337,136 @@ class NetworkAids(Hyperparameters):
 
         return loss.item()
 
+    def learn_DDQN_e2e(self, networks, gsp_networks):
+        """End-to-end joint training of DDQN + GSP head.
+
+        At each learn step:
+        1. Sample 7-value batch from main replay (requires gsp_obs_size > 0).
+        2. Re-run GSP head on gsp_obs WITH gradient to produce fresh prediction.
+        3. Replace the stale GSP scalar in the stored state with the fresh value.
+        4. Run DDQN on augmented state.
+        5. Compute combined loss: ddqn_loss + lambda * MSE(fresh_gsp, label).
+        6. Backward through both networks, clip GSP gradients, step both optimizers.
+
+        The next-state Q-target uses STORED states_ as-is (no GSP re-run) wrapped
+        in torch.no_grad() — stable targets are critical for DDQN convergence.
+
+        Args:
+            networks: Main DDQN networks dict (must contain 'q_eval', 'q_next',
+                'replay', 'learning_scheme', 'learn_step_counter').
+            gsp_networks: GSP networks dict (must contain 'actor', 'learning_scheme').
+
+        Returns:
+            dict with keys: ddqn_loss, gsp_mse_loss, total_loss, gsp_grad_norm,
+                gsp_grad_norm_pre_clip, ddqn_grad_norm, gsp_input_grad,
+                gsp_pred_mean, gsp_pred_std, gsp_label_mean, gsp_label_std.
+        """
+        e2e_lambda = float(getattr(self, 'gsp_e2e_lambda', 1.0))
+        device = networks['q_eval'].device
+
+        # --- 1. Sample 7 values directly from main replay ---
+        result = networks['replay'].sample_buffer(self.batch_size)
+        states_np, actions_np, rewards_np, states_np_, dones_np, gsp_obs_np, gsp_labels_np = result
+
+        states = T.tensor(states_np, dtype=T.float32).to(device)
+        actions = T.tensor(actions_np, dtype=T.float32).to(device)
+        rewards = T.tensor(rewards_np, dtype=T.float32).to(device)
+        states_ = T.tensor(states_np_, dtype=T.float32).to(device)
+        dones = T.tensor(dones_np).to(device)
+        gsp_obs = T.tensor(gsp_obs_np, dtype=T.float32).to(device)
+        gsp_labels = T.tensor(gsp_labels_np, dtype=T.float32).to(device)
+
+        # --- Zero both optimizers before any forward pass ---
+        networks['q_eval'].optimizer.zero_grad()
+        gsp_networks['actor'].optimizer.zero_grad()
+
+        # --- 2. Re-run GSP head WITH gradient ---
+        gsp_pred = gsp_networks['actor'].forward(gsp_obs)
+        # gsp_pred shape: (batch, 1) or (batch,) — normalize to (batch, 1)
+        if gsp_pred.dim() == 1:
+            gsp_pred = gsp_pred.unsqueeze(1)
+
+        # --- 3. Replace stale GSP scalar in state ---
+        # State layout: [env_obs(input_size), gsp_scalar(1), optional_gk(...)]
+        # self.input_size is the raw env obs dimensionality (e.g. 31).
+        gsp_idx = self.input_size
+        augmented = T.cat(
+            [states[:, :gsp_idx], gsp_pred, states[:, gsp_idx + 1:]], dim=1
+        )
+        augmented.retain_grad()
+
+        # --- 4. DDQN forward on augmented state ---
+        indices = T.LongTensor(np.arange(self.batch_size).astype(np.int64))
+        q_pred = networks['q_eval'](augmented)[indices, actions.type(T.LongTensor)]
+
+        # --- 5. Target Q using STORED next-state (no GSP re-run) ---
+        with T.no_grad():
+            q_next = networks['q_next'](states_)
+            q_eval_next = networks['q_eval'](states_)
+            max_actions = T.argmax(q_eval_next, dim=1)
+            q_next[dones] = 0.0
+            q_target = rewards + self.gamma * q_next[indices, max_actions]
+
+        # --- 6. Combined loss ---
+        ddqn_loss = networks['q_eval'].loss(q_target, q_pred).to(device)
+
+        if gsp_labels.dim() == gsp_pred.dim() - 1:
+            gsp_labels = gsp_labels.unsqueeze(-1)
+        else:
+            gsp_labels = gsp_labels.view_as(gsp_pred)
+        gsp_mse_loss = F.mse_loss(gsp_pred, gsp_labels)
+
+        total_loss = ddqn_loss + e2e_lambda * gsp_mse_loss
+
+        # --- 7. Backward + gradient clipping ---
+        total_loss.backward()
+        _check_nan(total_loss, f"E2E total loss at step {networks['learn_step_counter']}")
+
+        # Pre-clip GSP grad norm for diagnostics
+        gsp_params = list(gsp_networks['actor'].parameters())
+        gsp_grad_norm_pre_clip = float(
+            T.norm(T.stack([p.grad.norm() for p in gsp_params if p.grad is not None]))
+        )
+
+        T.nn.utils.clip_grad_norm_(gsp_networks['actor'].parameters(), max_norm=1.0)
+
+        # Post-clip GSP grad norm
+        gsp_grad_norm = float(
+            T.norm(T.stack([p.grad.norm() for p in gsp_params if p.grad is not None]))
+        )
+
+        # DDQN Q-eval grad norm (before step)
+        q_params = list(networks['q_eval'].parameters())
+        ddqn_grad_norm = float(
+            T.norm(T.stack([p.grad.norm() for p in q_params if p.grad is not None]))
+        )
+
+        # Gradient at the GSP input dimension of the augmented state
+        gsp_input_grad = None
+        if augmented.grad is not None:
+            gsp_input_grad = float(augmented.grad[:, gsp_idx].abs().mean().item())
+
+        # --- 8. Step both optimizers ---
+        networks['q_eval'].optimizer.step()
+        gsp_networks['actor'].optimizer.step()
+
+        networks['learn_step_counter'] += 1
+        self.decrement_epsilon()
+
+        return {
+            'ddqn_loss': ddqn_loss.item(),
+            'gsp_mse_loss': gsp_mse_loss.item(),
+            'total_loss': total_loss.item(),
+            'gsp_grad_norm': gsp_grad_norm,
+            'gsp_grad_norm_pre_clip': gsp_grad_norm_pre_clip,
+            'ddqn_grad_norm': ddqn_grad_norm,
+            'gsp_input_grad': gsp_input_grad,
+            'gsp_pred_mean': float(gsp_pred.detach().mean().item()),
+            'gsp_pred_std': float(gsp_pred.detach().std().item()),
+            'gsp_label_mean': float(gsp_labels.detach().mean().item()),
+            'gsp_label_std': float(gsp_labels.detach().std().item()),
+        }
+
     def learn_DDPG(self, networks, gsp = False, recurrent = False):
         states, actions, rewards, states_, dones = self.sample_memory(networks)
         target_actions = networks['target_actor'](states_)
@@ -621,13 +751,33 @@ class NetworkAids(Hyperparameters):
             device = networks['actor'].device
 
         if len(result) == 7:
-            states, actions, rewards, states_, dones, h_batch, c_batch = result
-            states = T.tensor(states, dtype=T.float32).to(device)
-            actions = T.tensor(actions, dtype=T.float32).to(device)
-            rewards = T.tensor(rewards, dtype=T.float32).to(device)
-            states_ = T.tensor(states_, dtype=T.float32).to(device)
-            dones = T.tensor(dones).to(device)
-            return states, actions, rewards, states_, dones, h_batch, c_batch
+            # Two sources of 7-value returns:
+            # 1. SequenceReplayBuffer: items 5 and 6 are h_batch, c_batch — lists
+            #    of tuples (hidden states), not numpy arrays.
+            # 2. ReplayBuffer with gsp_obs_size > 0: items 5 and 6 are numpy
+            #    arrays (gsp_obs, gsp_labels). learn_DDQN_e2e calls sample_buffer
+            #    directly to get these — legacy callers only need the first 5.
+            extra5 = result[5]
+            if isinstance(extra5, np.ndarray):
+                # E2E replay path: discard gsp_obs and gsp_labels for legacy callers.
+                states, actions, rewards, states_, dones = (
+                    result[0], result[1], result[2], result[3], result[4]
+                )
+                states = T.tensor(states, dtype=T.float32).to(device)
+                actions = T.tensor(actions, dtype=T.float32).to(device)
+                rewards = T.tensor(rewards, dtype=T.float32).to(device)
+                states_ = T.tensor(states_, dtype=T.float32).to(device)
+                dones = T.tensor(dones).to(device)
+                return states, actions, rewards, states_, dones
+            else:
+                # Sequence replay path: return all 7 (h_batch, c_batch are tensors/tuples).
+                states, actions, rewards, states_, dones, h_batch, c_batch = result
+                states = T.tensor(states, dtype=T.float32).to(device)
+                actions = T.tensor(actions, dtype=T.float32).to(device)
+                rewards = T.tensor(rewards, dtype=T.float32).to(device)
+                states_ = T.tensor(states_, dtype=T.float32).to(device)
+                dones = T.tensor(dones).to(device)
+                return states, actions, rewards, states_, dones, h_batch, c_batch
         else:
             states, actions, rewards, states_, dones = result
             states = T.tensor(states, dtype=T.float32).to(device)
