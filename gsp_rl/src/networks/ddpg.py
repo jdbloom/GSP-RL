@@ -54,6 +54,7 @@ class DDPGActorNetwork(nn.Module):
             weight_decay: float = 1e-4,
             init_w: float = 3e-3,
             use_layer_norm: bool = False,
+            use_linear_output: bool = False,
     ) -> None:
         """Initialize DDPG actor network.
 
@@ -65,7 +66,8 @@ class DDPGActorNetwork(nn.Module):
             fc1_dims: First hidden layer width.
             fc2_dims: Second hidden layer width.
             name: Base name for checkpoint files.
-            min_max_action: Tanh output scaling factor.
+            min_max_action: Tanh output scaling factor (or clamp bound when
+                use_linear_output=True).
             weight_decay: Adam weight decay. Default 1e-4 preserves legacy behavior;
                 set to 0 in the GSP-head ablation to test the decoupled-decay hypothesis.
             init_w: Output layer weight init half-range. Default 3e-3 preserves legacy;
@@ -77,6 +79,11 @@ class DDPGActorNetwork(nn.Module):
                 Placement is the trunk (not pre-tanh) because the failure mode identified
                 in the ddpg-vs-attention analysis is a dead-ReLU cascade, not an
                 output-layer issue.
+            use_linear_output: If True, replace tanh with a hard clamp to
+                [-min_max_action, min_max_action]. Defaults to False (legacy tanh).
+                Motivated by MARL communication literature (DIAL, CommNet, TarMAC)
+                where unbounded/linearly-bounded messages during training avoid the
+                gradient attenuation tanh introduces near ±1 and near 0.
         """
         super().__init__()
 
@@ -87,6 +94,7 @@ class DDPGActorNetwork(nn.Module):
         self.fc1_dims = fc1_dims
         self.fc2_dims = fc2_dims
         self.use_layer_norm = use_layer_norm
+        self.use_linear_output = use_linear_output
 
         self.fc1 = nn.Linear(input_size, self.fc1_dims)
         self.fc2 = nn.Linear(self.fc1_dims, self.fc2_dims)
@@ -141,7 +149,10 @@ class DDPGActorNetwork(nn.Module):
         prob = self.relu(prob)
         penultimate = prob  # post-ReLU activation at fc2 is the "features" VICReg regularizes
         mu = self.mu(prob)
-        mu = self.min_max_action*self.tanh(mu)
+        if self.use_linear_output:
+            mu = T.clamp(mu, -self.min_max_action, self.min_max_action)
+        else:
+            mu = self.min_max_action * self.tanh(mu)
         if return_features:
             return mu, penultimate
         return mu
