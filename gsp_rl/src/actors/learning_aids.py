@@ -122,6 +122,14 @@ class Hyperparameters:
         self.gsp_e2e_lambda = float(config.get('GSP_E2E_LAMBDA', 1.0))
         self.gsp_e2e_linear_output = bool(config.get('GSP_E2E_LINEAR_OUTPUT', False))
 
+        # H-13 closure: LayerNorm in the main DQN/DDQN action network's trunk.
+        # Independent of GSP_USE_LAYER_NORM (which only affects the GSP head).
+        # Default False preserves legacy behavior. See
+        # docs/research/gsp-hypothesis-tracker.md H-13 for the rationale (j44 vs
+        # j123: 96% vs 18% final success with same collapsed GSP head, suggesting
+        # actor-side LN drives the difference).
+        self.actor_use_layer_norm = bool(config.get('ACTOR_USE_LAYER_NORM', False))
+
         self.noise = config['NOISE']
         self.update_actor_iter = config['UPDATE_ACTOR_ITER']
         self.warmup = config['WARMUP']

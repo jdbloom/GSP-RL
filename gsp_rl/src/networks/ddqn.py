@@ -35,7 +35,8 @@ class DDQN(nn.Module):
             output_size: int,
             fc1_dims: int = 64,
             fc2_dims: int = 128,
-            name: str = 'DDQN'
+            name: str = 'DDQN',
+            use_layer_norm: bool = False,
     ) -> None:
         """Initialize DDQN network.
 
@@ -47,14 +48,25 @@ class DDQN(nn.Module):
             fc1_dims: First hidden layer width.
             fc2_dims: Second hidden layer width.
             name: Network name for checkpoint file naming.
+            use_layer_norm: If True, insert LayerNorm after fc1 and fc2 (before each
+                ReLU). Defaults to False (legacy). Controlled by ACTOR_USE_LAYER_NORM
+                config flag — separate from the GSP head's GSP_USE_LAYER_NORM. The
+                trunk placement follows BRO (NeurIPS 2024) and Lyle et al. (NeurIPS
+                2024) which show LN in the trunk is the most effective off-policy RL
+                plasticity stabilizer.
         """
         super().__init__()
 
         self.name = name
+        self.use_layer_norm = use_layer_norm
 
         self.fc1 = nn.Linear(input_size, fc1_dims)
         self.fc2 = nn.Linear(fc1_dims, fc2_dims)
         self.fc3 = nn.Linear(fc2_dims, output_size)
+
+        if self.use_layer_norm:
+            self.ln1 = nn.LayerNorm(fc1_dims)
+            self.ln2 = nn.LayerNorm(fc2_dims)
 
         self.optimizer = optim.Adam(self.parameters(), lr = lr, weight_decay = 1e-4)
 
@@ -73,8 +85,14 @@ class DDQN(nn.Module):
         Returns:
             Q-values tensor of shape (*, output_size).
         """
-        x = F.relu(self.fc1(state))
-        x1 = F.relu(self.fc2(x))
+        x = self.fc1(state)
+        if self.use_layer_norm:
+            x = self.ln1(x)
+        x = F.relu(x)
+        x = self.fc2(x)
+        if self.use_layer_norm:
+            x = self.ln2(x)
+        x1 = F.relu(x)
         actions = self.fc3(x1)
         return actions
 

@@ -156,6 +156,7 @@ class Actor(NetworkAids):
                 'lr':self.lr,
                 'output_size':self.output_size,
                 'input_size':self.network_input_size,
+                'use_layer_norm': getattr(self, 'actor_use_layer_norm', False),
             }
             self.networks = self.build_DQN(nn_args)
             self.networks['learning_scheme'] = 'DQN'
@@ -168,6 +169,7 @@ class Actor(NetworkAids):
                 'lr':self.lr,
                 'output_size':self.output_size,
                 'input_size':self.network_input_size,
+                'use_layer_norm': getattr(self, 'actor_use_layer_norm', False),
             }
             self.networks = self.build_DDQN(nn_args)
             self.networks['learning_scheme'] = 'DDQN'
