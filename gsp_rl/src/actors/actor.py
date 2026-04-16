@@ -515,8 +515,8 @@ class Actor(NetworkAids):
                 return
             self.last_gsp_loss = float(loss)
 
-    def store_agent_transition(self, s, a, r, s_, d):
-        self.store_transition(s, a, r, s_, d, self.networks)
+    def store_agent_transition(self, s, a, r, s_, d, gsp_obs=None, gsp_label=None):
+        self.store_transition(s, a, r, s_, d, self.networks, gsp_obs=gsp_obs, gsp_label=gsp_label)
     
     def store_gsp_transition(self, s, a, r, s_, d):
         if self.attention_gsp:

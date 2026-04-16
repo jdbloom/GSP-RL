@@ -741,8 +741,8 @@ class NetworkAids(Hyperparameters):
     def decrement_epsilon(self):
         self.epsilon = max(self.epsilon-self.eps_dec, self.eps_min)
 
-    def store_transition(self, s, a, r, s_, d, networks):
-        networks['replay'].store_transition(s, a, r, s_, d)
+    def store_transition(self, s, a, r, s_, d, networks, gsp_obs=None, gsp_label=None):
+        networks['replay'].store_transition(s, a, r, s_, d, gsp_obs=gsp_obs, gsp_label=gsp_label)
     
     def store_attention_transition(self, s, y, networks):
         networks['replay'].store_transition(s, y)

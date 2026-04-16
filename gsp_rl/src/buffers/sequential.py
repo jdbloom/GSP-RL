@@ -95,10 +95,15 @@ class SequenceReplayBuffer:
             a: np.ndarray,
             r: float,
             s_: np.ndarray,
-            d: bool
+            d: bool,
+            gsp_obs: np.ndarray = None,
+            gsp_label: np.ndarray = None,
     ) -> None:
         """
-        Store the SARSD Experience until the trajectory length is met
+        Store the SARSD Experience until the trajectory length is met.
+        gsp_obs and gsp_label are accepted for API compatibility with
+        ReplayBuffer but are not stored (SequenceReplayBuffer does not
+        support the e2e GSP path).
         """
         mem_index = self.mem_ctr % self.mem_size
         # import ipdb; ipdb.set_trace()
