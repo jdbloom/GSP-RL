@@ -469,8 +469,12 @@ class Actor(NetworkAids):
 
         if self.networks['learning_scheme'] == 'DDQN' and getattr(self, 'gsp_e2e_enabled', False) and self.gsp:
             self.replace_target_network()
-            self.last_e2e_diagnostics = self.learn_DDQN_e2e(self.networks, self.gsp_networks)
-            return self.last_e2e_diagnostics
+            result = self.learn_DDQN_e2e(self.networks, self.gsp_networks)
+            self.last_e2e_diagnostics = result
+            if result is not None:
+                self.last_gsp_loss = result.get('gsp_mse_loss')
+                return result.get('ddqn_loss')  # Main.py expects a scalar, not a dict
+            return None
 
         if self.networks['learning_scheme'] == 'DQN':
             self.replace_target_network()
