@@ -144,7 +144,9 @@ class Actor(NetworkAids):
         # start of each learn() call so callers can distinguish "no GSP step this tick" from
         # "GSP step ran".
         self.last_gsp_loss: float | None = None
-            
+        # Populated by learn() when the e2e path fires; reset to None each learn() call.
+        self.last_e2e_diagnostics = None
+
     def build_networks(self, learning_scheme):
         if learning_scheme == 'None':
             self.networks = {'learning_scheme': '', 'learn_step_counter': 0}
@@ -157,18 +159,20 @@ class Actor(NetworkAids):
             }
             self.networks = self.build_DQN(nn_args)
             self.networks['learning_scheme'] = 'DQN'
-            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, 1, 'Discrete')
+            gsp_obs_sz = self.gsp_network_input if getattr(self, 'gsp_e2e_enabled', False) else 0
+            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, 1, 'Discrete', gsp_obs_size=gsp_obs_sz)
             self.networks['learn_step_counter'] = 0
         elif learning_scheme == 'DDQN':
             nn_args = {
-                'id':self.id, 
-                'lr':self.lr, 
-                'output_size':self.output_size, 
+                'id':self.id,
+                'lr':self.lr,
+                'output_size':self.output_size,
                 'input_size':self.network_input_size,
             }
             self.networks = self.build_DDQN(nn_args)
             self.networks['learning_scheme'] = 'DDQN'
-            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, 1, 'Discrete')
+            gsp_obs_sz = self.gsp_network_input if getattr(self, 'gsp_e2e_enabled', False) else 0
+            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, 1, 'Discrete', gsp_obs_size=gsp_obs_sz)
             self.networks['learn_step_counter'] = 0
         elif learning_scheme == 'DDPG':
             actor_nn_args = {
@@ -328,6 +332,9 @@ class Actor(NetworkAids):
             # Task 4: LayerNorm in the GSP head trunk. Placement: after fc1 and fc2,
             # before each ReLU. Default False preserves legacy.
             'use_layer_norm': getattr(self, 'gsp_use_layer_norm', False),
+            # Task 5: linear (no tanh) output activation for e2e regression head.
+            # Default False preserves legacy tanh-bounded output.
+            'use_linear_output': getattr(self, 'gsp_e2e_linear_output', False),
         }
         critic_nn_args = {
             'id':self.id,
@@ -447,8 +454,9 @@ class Actor(NetworkAids):
                 f"Use choose_action() for RDDPG/attention networks.")
 
     def learn(self):
-        # Reset per-tick GSP loss signal. None means "no GSP step ran this tick".
+        # Reset per-tick diagnostic signals. None means "no step ran this tick".
         self.last_gsp_loss = None
+        self.last_e2e_diagnostics = None
 
         # TODO Not sure why we have n_agents*batch_size + batch_size
         if self.networks['replay'].mem_ctr < self.batch_size: # (self.n_agents*self.batch_size + self.batch_size):
@@ -459,9 +467,14 @@ class Actor(NetworkAids):
                 #print('[DEBUG] Learning Attention', self.networks['learn_step_counter'])
                 self.learn_gsp()
 
+        if self.networks['learning_scheme'] == 'DDQN' and getattr(self, 'gsp_e2e_enabled', False) and self.gsp:
+            self.replace_target_network()
+            self.last_e2e_diagnostics = self.learn_DDQN_e2e(self.networks, self.gsp_networks)
+            return self.last_e2e_diagnostics
+
         if self.networks['learning_scheme'] == 'DQN':
             self.replace_target_network()
-            
+
             return self.learn_DQN(self.networks)
 
         elif self.networks['learning_scheme'] == 'DDQN':

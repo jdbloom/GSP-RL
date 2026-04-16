@@ -118,6 +118,10 @@ class Hyperparameters:
         self.mem_size = config['MEM_SIZE']
         self.replace_target_ctr = config['REPLACE_TARGET_COUNTER']
 
+        self.gsp_e2e_enabled = bool(config.get('GSP_E2E_ENABLED', False))
+        self.gsp_e2e_lambda = float(config.get('GSP_E2E_LAMBDA', 1.0))
+        self.gsp_e2e_linear_output = bool(config.get('GSP_E2E_LINEAR_OUTPUT', False))
+
         self.noise = config['NOISE']
         self.update_actor_iter = config['UPDATE_ACTOR_ITER']
         self.warmup = config['WARMUP']
