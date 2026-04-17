@@ -139,6 +139,16 @@ class Hyperparameters:
         self.diagnostics_cadence = int(config.get('DIAGNOSTICS_CADENCE', 10))
         self.diagnostics_batch_size = int(config.get('DIAGNOSTICS_BATCH_SIZE', 1024))
 
+        # H-14 GSP-minus ablation flag. When True, the GSP head still runs (gets
+        # trained, produces predictions) but those predictions are REPLACED WITH
+        # ZERO before concatenation into the actor's augmented observation. This
+        # is the QMIP-minus pattern — same architecture, same training, signal
+        # removed — the clean test of "does the GSP prediction contribute?".
+        # Applied in RL-CollectiveTransport's agent.make_agent_state; the flag
+        # only matters if the host code reads it (gsp-rl does not use the value
+        # itself). Default False preserves legacy behavior.
+        self.gsp_zero_out_signal = bool(config.get('GSP_ZERO_OUT_SIGNAL', False))
+
         self.noise = config['NOISE']
         self.update_actor_iter = config['UPDATE_ACTOR_ITER']
         self.warmup = config['WARMUP']
