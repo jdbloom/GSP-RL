@@ -96,6 +96,19 @@ class DDQN(nn.Module):
         actions = self.fc3(x1)
         return actions
 
+    def penultimate(self, state: T.Tensor) -> T.Tensor:
+        """Return post-ReLU activations of fc2 — the feature vector immediately
+        before the output layer. Used by diagnostics (effective rank).
+        """
+        x = self.fc1(state)
+        if self.use_layer_norm:
+            x = self.ln1(x)
+        x = F.relu(x)
+        x = self.fc2(x)
+        if self.use_layer_norm:
+            x = self.ln2(x)
+        return F.relu(x)
+
     def save_checkpoint(self, path: str, intention: bool = False) -> None:
         """ Saves the model """
         network_name = self.name

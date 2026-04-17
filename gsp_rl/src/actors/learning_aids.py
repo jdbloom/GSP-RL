@@ -130,6 +130,15 @@ class Hyperparameters:
         # actor-side LN drives the difference).
         self.actor_use_layer_norm = bool(config.get('ACTOR_USE_LAYER_NORM', False))
 
+        # Per-episode diagnostics instrumentation (FAU, weight norms, effective
+        # rank, Q-gap, pred diversity). Default OFF to preserve legacy runs
+        # untouched. Opt-in via ``DIAGNOSTICS_ENABLED: true``. Spec:
+        # docs/specs/2026-04-17-diagnostics-instrumentation.md.
+        self.diagnostics_enabled = bool(config.get('DIAGNOSTICS_ENABLED', False))
+        self.diagnostics_freeze_episode = int(config.get('DIAGNOSTICS_FREEZE_EPISODE', 50))
+        self.diagnostics_cadence = int(config.get('DIAGNOSTICS_CADENCE', 10))
+        self.diagnostics_batch_size = int(config.get('DIAGNOSTICS_BATCH_SIZE', 1024))
+
         self.noise = config['NOISE']
         self.update_actor_iter = config['UPDATE_ACTOR_ITER']
         self.warmup = config['WARMUP']

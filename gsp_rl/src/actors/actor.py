@@ -530,6 +530,114 @@ class Actor(NetworkAids):
         else:
             self.store_transition(s, a, r, s_, d, self.gsp_networks)
 
+    def freeze_diagnostic_batch(self, gsp_obs_pool=None):
+        """Sample + freeze the eval batch used for all per-episode diagnostic
+        computations through the rest of training.
+
+        Called once when ``self.diagnostics_freeze_episode`` is reached AND the
+        replay buffer has at least ``self.diagnostics_batch_size`` entries.
+
+        Args:
+            gsp_obs_pool: optional numpy array of shape (M, gsp_input_size) of
+                recent GSP head input vectors (typically captured by Main.py
+                from the live training loop). If ``None``, GSP diagnostics will
+                be skipped (only actor diagnostics computed).
+
+        Stores on self:
+            diag_actor_eval_batch: (batch_size, actor_input_size) float32
+            diag_gsp_eval_batch:   (batch_size, gsp_input_size) float32 or None
+        """
+        if not self.diagnostics_enabled:
+            return
+        rng = np.random.default_rng(int(self.id) * 7919 + 13)
+        replay = self.networks['replay']
+        max_mem = min(replay.mem_ctr, replay.mem_size)
+        if max_mem < self.diagnostics_batch_size:
+            # Not enough samples yet; caller should retry next episode.
+            return
+        idx = rng.choice(max_mem, self.diagnostics_batch_size, replace=False)
+        self.diag_actor_eval_batch = replay.state_memory[idx].astype(np.float32)
+
+        self.diag_gsp_eval_batch = None
+        if gsp_obs_pool is not None and len(gsp_obs_pool) >= self.diagnostics_batch_size:
+            pool = np.asarray(gsp_obs_pool, dtype=np.float32)
+            gsp_idx = rng.choice(len(pool), self.diagnostics_batch_size, replace=False)
+            self.diag_gsp_eval_batch = pool[gsp_idx]
+
+    def compute_diagnostics(self, gsp_predictions_this_episode=None) -> dict:
+        """Run all diagnostic functions against the frozen eval batches.
+
+        Returns a dict of namespaced scalar metrics ready to pass to
+        ``HDF5Logger.record_episode_diagnostics``. Keys prefixed ``diag_``.
+
+        Args:
+            gsp_predictions_this_episode: optional 1-D numpy array of per-timestep
+                GSP predictions from the episode, used to compute prediction
+                diversity (Shannon entropy of binned predictions).
+
+        Returns:
+            Empty dict if diagnostics aren't enabled or the eval batch hasn't
+            been frozen yet; otherwise a dict with the full diagnostic set.
+        """
+        if not self.diagnostics_enabled:
+            return {}
+        if not hasattr(self, 'diag_actor_eval_batch') or self.diag_actor_eval_batch is None:
+            return {}
+        # Imports deferred so that users who don't enable diagnostics don't pay
+        # the import cost.
+        from gsp_rl.src.actors.diagnostics import (
+            compute_fau,
+            compute_overactive_fau,
+            compute_weight_norms,
+            compute_effective_rank,
+            compute_q_action_gap,
+            compute_gsp_pred_diversity,
+        )
+
+        out: dict = {}
+        q_eval = self.networks.get('q_eval')
+        device = next(q_eval.parameters()).device if q_eval is not None else T.device('cpu')
+        actor_batch = T.from_numpy(self.diag_actor_eval_batch).to(device)
+
+        if q_eval is not None:
+            for k, v in compute_fau(q_eval, actor_batch, ['fc1', 'fc2']).items():
+                out[f'diag_actor_{k}'] = v
+            for k, v in compute_overactive_fau(q_eval, actor_batch, ['fc1', 'fc2']).items():
+                out[f'diag_actor_{k}'] = v
+            for k, v in compute_weight_norms(q_eval, ['fc1', 'fc2', 'fc3']).items():
+                out[f'diag_actor_{k}'] = v
+            if hasattr(q_eval, 'penultimate'):
+                out['diag_actor_erank_penult'] = compute_effective_rank(
+                    q_eval, actor_batch, penultimate_fn='penultimate'
+                )
+            for k, v in compute_q_action_gap(q_eval, actor_batch).items():
+                out[f'diag_{k}'] = v
+
+        # GSP head diagnostics — only if the head exists AND we captured gsp_obs pool
+        if self.gsp_networks is not None and self.diag_gsp_eval_batch is not None:
+            gsp_head = self.gsp_networks.get('actor') or self.gsp_networks.get('q_eval')
+            if gsp_head is not None:
+                gsp_device = next(gsp_head.parameters()).device
+                gsp_batch = T.from_numpy(self.diag_gsp_eval_batch).to(gsp_device)
+                for k, v in compute_fau(gsp_head, gsp_batch, ['fc1', 'fc2']).items():
+                    out[f'diag_gsp_{k}'] = v
+                for k, v in compute_overactive_fau(gsp_head, gsp_batch, ['fc1', 'fc2']).items():
+                    out[f'diag_gsp_{k}'] = v
+                for k, v in compute_weight_norms(gsp_head, ['fc1', 'fc2', 'mu']).items():
+                    out[f'diag_gsp_{k}'] = v
+                if hasattr(gsp_head, 'penultimate'):
+                    out['diag_gsp_erank_penult'] = compute_effective_rank(
+                        gsp_head, gsp_batch, penultimate_fn='penultimate'
+                    )
+
+        # GSP prediction diversity (this-episode entropy, not eval-batch based)
+        if gsp_predictions_this_episode is not None:
+            preds = np.asarray(gsp_predictions_this_episode, dtype=np.float32).ravel()
+            if preds.size > 0:
+                out['diag_gsp_pred_diversity'] = compute_gsp_pred_diversity(preds)
+
+        return out
+
     def reset_gsp_sequence(self):
         self.gsp_sequence = [np.zeros(self.gsp_network_input) for i in range(self.gsp_sequence_length)]
     

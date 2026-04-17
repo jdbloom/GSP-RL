@@ -157,6 +157,21 @@ class DDPGActorNetwork(nn.Module):
             return mu, penultimate
         return mu
 
+    def penultimate(self, x: T.Tensor) -> T.Tensor:
+        """Return post-ReLU activations of fc2 — the feature vector immediately
+        before the output linear (mu). Alias to the existing return_features=True
+        forward path but exposed under the standard diagnostics method name so
+        compute_effective_rank can find it consistently across network classes.
+        """
+        prob = self.fc1(x)
+        if self.use_layer_norm:
+            prob = self.ln1(prob)
+        prob = self.relu(prob)
+        prob = self.fc2(prob)
+        if self.use_layer_norm:
+            prob = self.ln2(prob)
+        return self.relu(prob)
+
     def save_checkpoint(self, path: str, intention=False) -> None:
         """ Saves the Model"""
         network_name = self.name
