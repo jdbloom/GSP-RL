@@ -149,6 +149,18 @@ class Hyperparameters:
         # itself). Default False preserves legacy behavior.
         self.gsp_zero_out_signal = bool(config.get('GSP_ZERO_OUT_SIGNAL', False))
 
+        # Candidate A — change what the GSP head predicts. Default 'delta_theta'
+        # is the legacy collective-Δθ target used in all dissertation runs (and
+        # the target that produced the head collapse documented in H-13/H-14).
+        # 'future_prox' retargets each robot's head to predict its own proximity
+        # K=GSP_PREDICTION_HORIZON steps ahead — non-self-referential because
+        # prox is determined by environment geometry + multi-agent action, not
+        # directly chosen by the robot's own action. The flag is read here; the
+        # delayed-label buffer that produces (state_t, prox_{t+K}) training pairs
+        # lives in the host code (RL-CollectiveTransport agent.py).
+        self.gsp_prediction_target = str(config.get('GSP_PREDICTION_TARGET', 'delta_theta'))
+        self.gsp_prediction_horizon = int(config.get('GSP_PREDICTION_HORIZON', 5))
+
         self.noise = config['NOISE']
         self.update_actor_iter = config['UPDATE_ACTOR_ITER']
         self.warmup = config['WARMUP']
