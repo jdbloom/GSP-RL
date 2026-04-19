@@ -63,6 +63,7 @@ class DDPGActorNetwork(nn.Module):
             init_w: float = 3e-3,
             use_layer_norm: bool = False,
             use_linear_output: bool = False,
+            init_scheme: str = "fanin",
     ) -> None:
         """Initialize DDPG actor network.
 
@@ -92,6 +93,15 @@ class DDPGActorNetwork(nn.Module):
                 Motivated by MARL communication literature (DIAL, CommNet, TarMAC)
                 where unbounded/linearly-bounded messages during training avoid the
                 gradient attenuation tanh introduces near ±1 and near 0.
+            init_scheme: Hidden-layer weight initialization scheme. One of:
+                - ``"fanin"`` (default): uniform in [-1/sqrt(fan_in), 1/sqrt(fan_in)].
+                  Preserves legacy behavior for all existing runs.
+                - ``"kaiming"``: Kaiming He normal init (std=sqrt(2/fan_in)) for fc1
+                  and fc2. Produces ~2.4x larger weights than fanin for typical GSP
+                  input sizes, which should reduce initial dead-ReLU fraction when the
+                  input distribution is positive-bounded (e.g., prox values in [0, 0.5]).
+                  The output layer (mu) always uses small uniform init_w regardless of
+                  this setting — Kaiming does not apply to output projections.
         """
         super().__init__()
 
@@ -103,6 +113,7 @@ class DDPGActorNetwork(nn.Module):
         self.fc2_dims = fc2_dims
         self.use_layer_norm = use_layer_norm
         self.use_linear_output = use_linear_output
+        self.init_scheme = init_scheme
 
         self.fc1 = nn.Linear(input_size, self.fc1_dims)
         self.fc2 = nn.Linear(self.fc1_dims, self.fc2_dims)
@@ -125,9 +136,22 @@ class DDPGActorNetwork(nn.Module):
 
 
     def init_weights(self, init_w: float) -> None:
-        """ Initializes weights of the network"""
-        self.fc1.weight.data = fanin_init(self.fc1.weight.data.size())
-        self.fc2.weight.data = fanin_init(self.fc2.weight.data.size())
+        """Initializes weights of the network.
+
+        Hidden layers (fc1, fc2) are initialized according to ``self.init_scheme``:
+        - ``"fanin"``: uniform in [-1/sqrt(fan_in), 1/sqrt(fan_in)] (legacy default).
+        - ``"kaiming"``: Kaiming He normal (mode='fan_in', nonlinearity='relu').
+
+        The output layer (mu) always uses small uniform [-init_w, init_w] regardless
+        of init_scheme — Kaiming does not apply to output projections.
+        """
+        if self.init_scheme == "kaiming":
+            T.nn.init.kaiming_normal_(self.fc1.weight, mode='fan_in', nonlinearity='relu')
+            T.nn.init.kaiming_normal_(self.fc2.weight, mode='fan_in', nonlinearity='relu')
+        else:
+            # Default: fanin uniform (legacy behavior — preserves all existing runs)
+            self.fc1.weight.data = fanin_init(self.fc1.weight.data.size())
+            self.fc2.weight.data = fanin_init(self.fc2.weight.data.size())
         self.mu.weight.data.uniform_(-init_w, init_w)
 
     def forward(self, x: T.Tensor, return_features: bool = False):

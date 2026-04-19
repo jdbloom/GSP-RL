@@ -103,6 +103,11 @@ class Actor(NetworkAids):
         self.gsp_fc2_dims = int(config.get('GSP_FC2_DIMS', 300))
         # Task 4: LayerNorm trunk placement on the GSP head. Default False preserves legacy.
         self.gsp_use_layer_norm = bool(config.get('GSP_USE_LAYER_NORM', False))
+        # Weight init scheme for the GSP head hidden layers. Default 'fanin' preserves
+        # legacy. 'kaiming' uses Kaiming He normal (std=sqrt(2/fan_in)) for ReLU networks.
+        # Motivation: fanin init is too narrow for positive-bounded inputs (prox in [0,0.5]),
+        # leaving 65-72% of fc1 units dormant from episode 1 (init-investigation j189-194).
+        self.gsp_init_scheme = str(config.get('GSP_INIT_SCHEME', 'fanin'))
         # Task 5: VICReg variance+covariance penalty on the GSP head penultimate features.
         # Default disabled. var_coef 1.0 and cov_coef 0.04 follow VICReg paper Table 9;
         # target_std is derived dynamically from label batch std in learn_gsp_mse.
@@ -337,6 +342,9 @@ class Actor(NetworkAids):
             # Task 5: linear (no tanh) output activation for e2e regression head.
             # Default False preserves legacy tanh-bounded output.
             'use_linear_output': getattr(self, 'gsp_e2e_linear_output', False),
+            # Weight init scheme for the GSP head's hidden layers.
+            # 'fanin' (default) preserves legacy. 'kaiming' uses He normal init.
+            'init_scheme': getattr(self, 'gsp_init_scheme', 'fanin'),
         }
         critic_nn_args = {
             'id':self.id,

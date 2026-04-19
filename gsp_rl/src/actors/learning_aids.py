@@ -166,6 +166,11 @@ class Hyperparameters:
         self.gsp_prediction_target = str(config.get('GSP_PREDICTION_TARGET', 'delta_theta'))
         self.gsp_prediction_horizon = int(config.get('GSP_PREDICTION_HORIZON', 5))
 
+        # Weight initialization scheme for the GSP head's hidden layers.
+        # 'fanin' (default) preserves legacy behavior for all in-flight runs.
+        # 'kaiming' uses Kaiming He normal init — see DDPGActorNetwork docstring.
+        self.gsp_init_scheme = str(config.get('GSP_INIT_SCHEME', 'fanin'))
+
         self.noise = config['NOISE']
         self.update_actor_iter = config['UPDATE_ACTOR_ITER']
         self.warmup = config['WARMUP']
