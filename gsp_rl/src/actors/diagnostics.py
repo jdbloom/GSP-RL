@@ -16,6 +16,9 @@ Metrics
 - ``compute_gsp_pred_diversity``Shannon entropy of binned predictions — catches collapse-to-constant
 - ``compute_hidden_norm``       Frobenius norm of LSTM hidden state over eval batch
 - ``compute_attention_entropy`` Shannon entropy over attention weights (stub when unhookable)
+- ``compute_grad_zero_fraction``fraction of weight gradients near zero per layer (He 2603.21173 OCP Thm 1)
+- ``compute_churn``             L2 distance between activations under before/after state_dicts (Tang 2506.00592)
+- ``compute_kfac_hessian_erank``effective rank of KFAC Gauss-Newton block-Hessian per layer (He 2509.22335)
 
 Design notes
 ------------
@@ -28,7 +31,9 @@ Design notes
 """
 from __future__ import annotations
 
+import copy
 import math
+from typing import Optional
 
 import numpy as np
 import torch
@@ -495,3 +500,341 @@ def compute_attention_entropy(
     # Shannon entropy: H = -sum(p * log(p)) along last dim
     entropy_per_qhk = -(p * p.log()).sum(dim=-1)  # (N, heads, query_len)
     return float(entropy_per_qhk.mean().item())
+
+
+# --------------------------------------------------------------------------------------
+# Gradient zero fraction per layer (He 2603.21173 OCP Theorem 1)
+# --------------------------------------------------------------------------------------
+
+def compute_grad_zero_fraction(
+    net: nn.Module,
+    loss_fn,
+    eval_batch: torch.Tensor,
+    layer_names: list[str],
+    eps: float = 1e-8,
+) -> dict[str, float]:
+    """Per-layer fraction of weight gradient entries with |grad| < eps.
+
+    Theory: OCP Theorem 1 (He 2603.21173) proves dormancy ≡ zero-gradient
+    equivalence under continuity assumptions. This metric should track FAU
+    closely; divergence between the two signals indicates a measurement artifact
+    or that the network has lost gradient flow without losing unit activation.
+
+    Implementation:
+    - Zeroes gradients, runs a forward pass through ``net`` with ``eval_batch``.
+    - Calls ``loss_fn(output, target)`` where target is zeros (we want to
+      detect gradient flow shut-off, not predictive accuracy).
+    - Calls ``.backward()`` to populate ``.grad`` on each parameter.
+    - For each named linear layer, counts the fraction of weight gradient
+      entries whose absolute value is below ``eps``.
+    - Restores zero-gradients after so this never perturbs training.
+
+    Args:
+        net: ``nn.Module`` with named ``nn.Linear`` submodules.
+        loss_fn: callable(output, target) -> scalar Tensor. A reasonable default
+            is ``torch.nn.functional.mse_loss`` with a zero target.
+        eval_batch: ``(N, input_dim)`` float tensor of states.
+        layer_names: list of layer names to probe (may use dotted paths).
+        eps: threshold below which a gradient entry counts as "zero".
+
+    Returns:
+        ``{"grad_zero_<layer_key>": float in [0, 1]}`` for each layer, where
+        layer_key replaces dots with underscores.
+    """
+    device = eval_batch.device
+    net.train()  # Need grad-mode; zero any existing grads first
+    net.zero_grad()
+
+    try:
+        output = net(eval_batch.to(device))
+        # Use zero target — we probe gradient flow, not prediction quality.
+        if isinstance(output, tuple):
+            # Some networks return (out, hidden); use the first element.
+            output = output[0]
+        target = torch.zeros_like(output)
+        loss = loss_fn(output, target)
+        loss.backward()
+    except Exception:
+        net.zero_grad()
+        net.eval()
+        return {f"grad_zero_{_safe_key(n)}": float("nan") for n in layer_names}
+
+    result: dict[str, float] = {}
+    for name in layer_names:
+        key = _safe_key(name)
+        metric_key = f"grad_zero_{key}"
+        layer = _resolve_layer(net, name)
+        if layer is None or not hasattr(layer, 'weight') or layer.weight.grad is None:
+            result[metric_key] = float("nan")
+            continue
+        grad = layer.weight.grad.detach()
+        result[metric_key] = float((grad.abs() < eps).float().mean().item())
+
+    net.zero_grad()
+    net.eval()
+    return result
+
+
+# --------------------------------------------------------------------------------------
+# Activation churn: L2 distance of activations under before vs after state_dicts
+# (Tang 2506.00592 C-CHAIN)
+# --------------------------------------------------------------------------------------
+
+def compute_churn(
+    net: nn.Module,
+    eval_batch: torch.Tensor,
+    before_state_dict: dict,
+    after_state_dict: dict,
+    layer_names: Optional[list[str]] = None,
+) -> dict[str, float]:
+    """L2 distance between activations on ``eval_batch`` under two state dicts.
+
+    Theory: C-CHAIN (Tang 2506.00592, ICML 2025) — high churn predicts
+    plasticity loss in the next ~100k training steps. High churn means the
+    network's functional representation changes significantly per update step,
+    which exhausts capacity faster.
+
+    Caller is responsible for snapshotting before/after state_dicts via
+    ``copy.deepcopy(net.state_dict())`` around a training step.
+
+    Args:
+        net: the network to evaluate on.
+        eval_batch: ``(N, input_dim)`` state batch.
+        before_state_dict: state dict captured before the training step.
+        after_state_dict: state dict captured after the training step.
+        layer_names: optional list of layer names (dotted) to measure per-layer
+            churn via forward hooks. If ``None``, only final-output churn is
+            returned.
+
+    Returns:
+        ``{"churn_output": float}`` always present. If ``layer_names`` given,
+        also ``{"churn_<layer_key>": float}`` per layer.
+        Frobenius norm of activation difference divided by sqrt(N) for
+        batch-size normalization.
+    """
+    device = eval_batch.device
+    x = eval_batch.to(device)
+    result: dict[str, float] = {}
+
+    def _capture_output_and_layers(state_dict, lnames):
+        """Load state_dict, run forward, capture output + per-layer activations."""
+        # Load weights into net
+        net.load_state_dict(state_dict)
+        net.eval()
+        activations: dict[str, torch.Tensor] = {}
+        hooks = []
+
+        if lnames:
+            def _make_hook(key: str):
+                def hook(_module, _inp, out):
+                    act = out
+                    if isinstance(act, tuple):
+                        act = act[0]
+                    activations[key] = act.detach()
+                return hook
+
+            for ln in lnames:
+                layer = _resolve_layer(net, ln)
+                if layer is not None:
+                    k = _safe_key(ln)
+                    hooks.append(layer.register_forward_hook(_make_hook(k)))
+
+        try:
+            with torch.no_grad():
+                out = net(x)
+            if isinstance(out, tuple):
+                out = out[0]
+            final_out = out.detach()
+        finally:
+            for h in hooks:
+                h.remove()
+
+        return final_out, activations
+
+    try:
+        out_before, acts_before = _capture_output_and_layers(before_state_dict, layer_names)
+        out_after, acts_after = _capture_output_and_layers(after_state_dict, layer_names)
+    except Exception:
+        return {"churn_output": float("nan")}
+
+    N = float(x.shape[0])
+    diff_out = out_after - out_before
+    result["churn_output"] = float(torch.linalg.norm(diff_out).item()) / (N ** 0.5)
+
+    if layer_names:
+        for ln in layer_names:
+            k = _safe_key(ln)
+            metric_key = f"churn_{k}"
+            if k in acts_before and k in acts_after:
+                diff = acts_after[k] - acts_before[k]
+                result[metric_key] = float(torch.linalg.norm(diff).item()) / (N ** 0.5)
+            else:
+                result[metric_key] = float("nan")
+
+    return result
+
+
+# --------------------------------------------------------------------------------------
+# KFAC Hessian effective rank per layer (He 2509.22335 Theorem 6.2)
+# --------------------------------------------------------------------------------------
+
+def compute_kfac_hessian_erank(
+    net: nn.Module,
+    eval_batch: torch.Tensor,
+    layer_names: list[str],
+    threshold: float = 0.99,
+) -> dict[str, float]:
+    """Per-layer effective rank of the Gauss-Newton block-Hessian via KFAC approximation.
+
+    Theory: He et al. 2509.22335 Theorem 6.2 — ``rank(H) ≤ P − k_τ(I+O+1)``
+    where k_τ is the dead-neuron count. Dead neurons cap the Hessian rank; this
+    metric probes the same collapse from the loss-curvature perspective.
+
+    KFAC approximation per layer:
+        H_l ≈ A_l ⊗ G_l
+    where:
+        A_l = E[a_l a_l^T]    — input activation covariance (d_in x d_in)
+        G_l = E[g_l g_l^T]    — pre-activation gradient covariance (d_out x d_out)
+
+    The effective rank of H_l ≈ erank(A_l) · erank(G_l) by the Kronecker rank
+    product property.
+
+    Implementation:
+    - Captures pre-activation inputs (a_l) via forward hooks.
+    - Captures pre-activation gradients (g_l = ∂L/∂z_l) via backward hooks.
+    - Computes A_l and G_l as outer-product averages over the batch.
+    - Applies the same 99%-SVD effective rank computation as compute_effective_rank.
+    - Zeroes gradients before and after so this never perturbs training.
+
+    Args:
+        net: network with named ``nn.Linear`` submodules.
+        eval_batch: ``(N, input_dim)`` batch. Spec recommends N=256 to bound
+            KFAC compute (the matrices are d_in x d_in and d_out x d_out, not N x N).
+        layer_names: list of layer names to probe (dotted paths supported).
+        threshold: cumulative-variance cutoff for effective rank (0.99 per spec).
+
+    Returns:
+        ``{"kfac_erank_<layer_key>": float}`` per layer — the product of
+        erank(A_l) and erank(G_l). Also returns
+        ``{"kfac_erank_A_<layer_key>": float}`` and
+        ``{"kfac_erank_G_<layer_key>": float}`` for separate analysis.
+    """
+    device = eval_batch.device
+    x = eval_batch.to(device)
+
+    net.train()  # backward requires grad mode
+    net.zero_grad()
+
+    inputs_per_layer: dict[str, list[torch.Tensor]] = {}
+    grads_per_layer: dict[str, list[torch.Tensor]] = {}
+    hooks = []
+
+    for name in layer_names:
+        layer = _resolve_layer(net, name)
+        if layer is None or not isinstance(layer, nn.Linear):
+            continue
+        key = _safe_key(name)
+        inputs_per_layer[key] = []
+        grads_per_layer[key] = []
+
+        def _make_forward_hook(k: str):
+            def hook(_module, inp, _out):
+                # inp is a tuple; first element is the layer input (pre-weight matmul)
+                a = inp[0].detach()  # (N, d_in)
+                inputs_per_layer[k].append(a)
+            return hook
+
+        def _make_backward_hook(k: str):
+            def hook(_module, _grad_in, grad_out):
+                # grad_out[0] is the gradient w.r.t. the layer's output (pre-activation)
+                g = grad_out[0].detach()  # (N, d_out)
+                grads_per_layer[k].append(g)
+            return hook
+
+        hooks.append(layer.register_forward_hook(_make_forward_hook(key)))
+        hooks.append(layer.register_full_backward_hook(_make_backward_hook(key)))
+
+    try:
+        output = net(x)
+        if isinstance(output, tuple):
+            output = output[0]
+        target = torch.zeros_like(output)
+        loss = torch.nn.functional.mse_loss(output, target)
+        loss.backward()
+    except Exception:
+        for h in hooks:
+            h.remove()
+        net.zero_grad()
+        net.eval()
+        return {f"kfac_erank_{_safe_key(n)}": float("nan") for n in layer_names}
+    finally:
+        for h in hooks:
+            h.remove()
+
+    net.zero_grad()
+    net.eval()
+
+    result: dict[str, float] = {}
+
+    def _svd_erank(mat: np.ndarray, thr: float) -> float:
+        """99%-SVD effective rank of a square matrix."""
+        if np.allclose(mat, 0.0, atol=1e-10):
+            return 0.0
+        try:
+            _, s, _ = np.linalg.svd(mat, full_matrices=False)
+        except np.linalg.LinAlgError:
+            return float("nan")
+        s2 = s ** 2
+        total = s2.sum()
+        if total <= 1e-20:
+            return 0.0
+        cumvar = np.cumsum(s2) / total
+        return float(int(np.searchsorted(cumvar, thr)) + 1)
+
+    for name in layer_names:
+        key = _safe_key(name)
+        metric_kfac = f"kfac_erank_{key}"
+        metric_A = f"kfac_erank_A_{key}"
+        metric_G = f"kfac_erank_G_{key}"
+
+        if key not in inputs_per_layer or not inputs_per_layer[key]:
+            result[metric_kfac] = float("nan")
+            result[metric_A] = float("nan")
+            result[metric_G] = float("nan")
+            continue
+
+        # Stack batch activations from possibly multiple accumulation calls
+        A_list = inputs_per_layer[key]
+        G_list = grads_per_layer.get(key, [])
+
+        try:
+            A_batch = torch.cat(A_list, dim=0).cpu().float()  # (N, d_in)
+            N = A_batch.shape[0]
+            # A_l = E[a a^T] = (1/N) * A^T A, giving (d_in, d_in)
+            A_cov = (A_batch.T @ A_batch / N).numpy().astype(np.float64)
+            erank_A = _svd_erank(A_cov, threshold)
+        except Exception:
+            result[metric_kfac] = float("nan")
+            result[metric_A] = float("nan")
+            result[metric_G] = float("nan")
+            continue
+
+        if G_list:
+            try:
+                G_batch = torch.cat(G_list, dim=0).cpu().float()  # (N, d_out)
+                N_g = G_batch.shape[0]
+                G_cov = (G_batch.T @ G_batch / N_g).numpy().astype(np.float64)
+                erank_G = _svd_erank(G_cov, threshold)
+            except Exception:
+                erank_G = float("nan")
+        else:
+            erank_G = float("nan")
+
+        result[metric_A] = erank_A
+        result[metric_G] = erank_G
+        if math.isfinite(erank_A) and math.isfinite(erank_G):
+            result[metric_kfac] = erank_A * erank_G
+        else:
+            result[metric_kfac] = float("nan")
+
+    return result

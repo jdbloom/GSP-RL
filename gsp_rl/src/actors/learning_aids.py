@@ -91,6 +91,76 @@ def vicreg_covariance_loss(h: T.Tensor) -> T.Tensor:
     return (off_diag ** 2).sum() / D
 
 
+def gsp_l2er_loss(actor_net, states: T.Tensor, eps: float = 1e-8) -> T.Tensor:
+    """Compute the differentiable effective-rank regularization loss for the GSP head.
+
+    Runs a partial forward pass through the actor network's fc1 and fc2 layers,
+    capturing the input activation tensor (pre-linear) at each layer. Then
+    computes the soft effective rank of each layer's input covariance matrix as:
+
+        erank(M) = exp( H(p) )    where H is Shannon entropy and
+        p_i = s_i^2 / sum(s^2)   with s = svdvals(M)
+
+    This is the Yang 2025 / He 2509.22335 soft-rank surrogate — fully
+    differentiable via torch.linalg.svdvals, which backprops through the SVD.
+
+    The returned loss is the *negative* sum of per-layer effective ranks:
+        L2ER = -sum_l erank(input_cov_l)
+
+    so that *subtracting* lambda * L2ER from the MSE loss is equivalent to
+    maximizing effective rank (pushing the representations toward full rank).
+
+    Only fc1 and fc2 inputs are regularized; the output projection (mu) is
+    skipped — the output head is a scalar projector and its rank is inherently 1.
+
+    Args:
+        actor_net: A DDPGActorNetwork (must have .fc1, .fc2, .relu attributes).
+        states: Input batch of shape (batch, input_size). Must be on the same
+            device as actor_net.
+        eps: Numerical floor for singular values to prevent log(0).
+
+    Returns:
+        Scalar tensor: -sum(erank_fc1, erank_fc2). Fully connected to the
+        computation graph — backward() populates gradients on actor_net.parameters().
+    """
+    def _erank(M: T.Tensor) -> T.Tensor:
+        """Soft effective rank of matrix M (batch, dim) via input covariance.
+
+        torch.linalg.svdvals is not implemented on MPS (Apple Silicon) as of
+        PyTorch 2.x. We move the matrix to CPU for the SVD, keeping the result
+        on the original device so gradient flow is preserved through the .to()
+        call. This is a small CPU detour (matrix is at most batch×dim, typically
+        16×400) and does not break the autograd graph.
+        """
+        # Input covariance: (dim, dim) — centre the batch
+        M_c = M - M.mean(dim=0, keepdim=True)
+        # Use the batch matrix directly for SVD (batch, dim) rather than
+        # forming (dim, dim) explicitly — avoids O(dim^2) memory and is
+        # identical in spectral structure up to a 1/(N-1) scale that cancels
+        # in the normalisation step.
+        M_cpu = M_c.to('cpu')  # MPS fallback: svdvals requires CPU on Apple Silicon
+        s = T.linalg.svdvals(M_cpu).to(M.device)
+        s = T.clamp(s, min=eps)
+        s2 = s ** 2
+        p = s2 / s2.sum()
+        # Shannon entropy (nats) then exp → effective rank
+        H = -(p * p.log()).sum()
+        return H.exp()
+
+    # Partial forward: capture inputs at fc1 and fc2
+    x_fc1 = states                                  # input to fc1
+    pre_act1 = actor_net.fc1(x_fc1)
+    if actor_net.use_layer_norm:
+        pre_act1 = actor_net.ln1(pre_act1)
+    x_fc2 = actor_net.relu(pre_act1)               # input to fc2
+
+    erank_fc1 = _erank(x_fc1)
+    erank_fc2 = _erank(x_fc2)
+
+    # Return negative sum so *subtracting* lambda * L2ER maximises rank
+    return -(erank_fc1 + erank_fc2)
+
+
 class Hyperparameters:
     """Configuration container loaded from a YAML config dict.
 
@@ -144,6 +214,29 @@ class Hyperparameters:
         # weight norms grow unboundedly during DDPG/TD3 training).
         self.diagnose_critic = bool(config.get('DIAGNOSE_CRITIC', False))
 
+        # Gradient zero fraction (He 2603.21173 OCP Thm 1) — cheap; default ON.
+        # Tracks the fraction of weight gradient entries near zero per named layer.
+        # Should co-vary with FAU under OCP continuity conditions; divergence
+        # indicates a measurement artifact or gradient flow shut-off without
+        # activation collapse. Layers probed are taken from DIAGNOSTIC_PROFILE
+        # 'grad_layers' key (defaults to 'fau_layers' if not specified).
+        self.diagnose_grad_zero = bool(config.get('DIAGNOSE_GRAD_ZERO', True))
+
+        # Activation churn (Tang 2506.00592 C-CHAIN) — cheap once state_dict
+        # snapshots exist; default ON. If no before/after snapshots are provided
+        # to compute_diagnostics(), this metric is silently skipped. Caller is
+        # responsible for snapshotting via copy.deepcopy(net.state_dict()) around
+        # a training step.
+        self.diagnose_churn = bool(config.get('DIAGNOSE_CHURN', True))
+
+        # KFAC Hessian effective rank (He 2509.22335 Thm 6.2) — most expensive of
+        # the three new metrics; requires a full forward+backward pass plus covariance
+        # matrix construction per layer. Default OFF; opt-in for targeted
+        # investigations of Hessian rank collapse. Layers probed are taken from
+        # DIAGNOSTIC_PROFILE 'kfac_layers' key (defaults to 'fau_layers' if not
+        # specified).
+        self.diagnose_kfac = bool(config.get('DIAGNOSE_KFAC', False))
+
         # H-14 GSP-minus ablation flag. When True, the GSP head still runs (gets
         # trained, produces predictions) but those predictions are REPLACED WITH
         # ZERO before concatenation into the actor's augmented observation. This
@@ -170,6 +263,14 @@ class Hyperparameters:
         # 'fanin' (default) preserves legacy behavior for all in-flight runs.
         # 'kaiming' uses Kaiming He normal init — see DDPGActorNetwork docstring.
         self.gsp_init_scheme = str(config.get('GSP_INIT_SCHEME', 'fanin'))
+
+        # Phase 3 — effective-rank regularization on the GSP head.
+        # When > 0 the MSE loss is reduced by lambda_er * sum(effective_rank per
+        # layer), pushing activations toward higher-rank (less collapsed)
+        # representations. See He et al. 2509.22335 for the theoretical grounding
+        # (OCP Theorem 1) and the Stelaris Phase-3 experiment plan.
+        # Default 0.0 → strict no-op, all historical runs unaffected.
+        self.gsp_l2er_lambda = float(config.get('GSP_L2ER_LAMBDA', 0.0))
 
         self.noise = config['NOISE']
         self.update_actor_iter = config['UPDATE_ACTOR_ITER']
@@ -780,6 +881,19 @@ class NetworkAids(Hyperparameters):
                 var_loss = vicreg_variance_loss(features, target_std=label_std)
                 cov_loss = vicreg_covariance_loss(features)
                 loss = mse_loss + var_coef * var_loss + cov_coef * cov_loss
+
+            # Phase 3 — L2-ER regularization.
+            # L_total = MSE - lambda_er * sum(erank_per_layer)
+            # Minimising L_total maximises effective rank at each layer, counteracting
+            # dormancy / rank collapse. gsp_l2er_loss returns the positive erank_sum
+            # so we subtract lambda * that quantity from the MSE loss.
+            # Guard with hasattr so the path is robust against non-DDPG GSP heads
+            # (attention variant does not have .fc1 / .fc2).
+            l2er_lambda = float(getattr(self, 'gsp_l2er_lambda', 0.0))
+            if l2er_lambda > 0.0 and hasattr(networks['actor'], 'fc1'):
+                l2er_erank_sum = -gsp_l2er_loss(networks['actor'], states)
+                # gsp_l2er_loss returns -(erank1+erank2); negating yields erank_sum > 0.
+                loss = loss - l2er_lambda * l2er_erank_sum
 
         loss.backward()
         _check_nan(loss, f"GSP MSE loss at step {networks['learn_step_counter']}")

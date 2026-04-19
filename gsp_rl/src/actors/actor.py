@@ -615,6 +615,11 @@ class Actor(NetworkAids):
         batch: T.Tensor,
         prefix: str,
         profile: dict,
+        diagnose_grad_zero: bool = False,
+        diagnose_kfac: bool = False,
+        churn_before_state_dict=None,
+        churn_after_state_dict=None,
+        diagnose_churn: bool = False,
     ) -> dict:
         """Run diagnostics on ``net`` using its ``DIAGNOSTIC_PROFILE``.
 
@@ -628,6 +633,18 @@ class Actor(NetworkAids):
             profile: The ``DIAGNOSTIC_PROFILE`` dict from the network class (or
                 fetched from the instance). Must have keys: ``fau_layers``,
                 ``wnorm_layers``, ``has_penultimate``, ``output_kind``.
+            diagnose_grad_zero: if True, compute gradient zero fraction per layer
+                (He 2603.21173 OCP Thm 1). Uses 'grad_layers' profile key
+                (falls back to 'fau_layers' if not present).
+            diagnose_kfac: if True, compute KFAC Hessian effective rank per layer
+                (He 2509.22335 Thm 6.2). Uses 'kfac_layers' profile key
+                (falls back to 'fau_layers' if not present).
+            churn_before_state_dict: state_dict snapshot before a training step.
+                Required (along with churn_after_state_dict and diagnose_churn=True)
+                for churn computation.
+            churn_after_state_dict: state_dict snapshot after a training step.
+            diagnose_churn: if True and both state_dict snapshots are provided,
+                compute activation churn (Tang 2506.00592 C-CHAIN).
 
         Returns:
             Dict of ``{prefix + '_' + metric_key: float}`` entries.
@@ -640,13 +657,20 @@ class Actor(NetworkAids):
             compute_q_action_gap,
             compute_hidden_norm,
             compute_attention_entropy,
+            compute_grad_zero_fraction,
+            compute_churn,
+            compute_kfac_hessian_erank,
         )
+        import torch.nn.functional as _F
 
         out: dict = {}
         fau_layers = profile.get('fau_layers', [])
         wnorm_layers = profile.get('wnorm_layers', [])
         has_penultimate = profile.get('has_penultimate', False)
         output_kind = profile.get('output_kind', '')
+        # New profile keys — fall back to fau_layers when not explicitly set.
+        grad_layers = profile.get('grad_layers', fau_layers)
+        kfac_layers = profile.get('kfac_layers', fau_layers)
 
         # FAU and overactive FAU — only if ReLU layers declared
         if fau_layers:
@@ -686,9 +710,43 @@ class Actor(NetworkAids):
         if output_kind == 'attention':
             out[f'{prefix}_attention_entropy'] = compute_attention_entropy(net, batch)
 
+        # --- New metrics ---
+
+        # Gradient zero fraction (cheap — default ON via diagnose_grad_zero flag)
+        if diagnose_grad_zero and grad_layers:
+            for k, v in compute_grad_zero_fraction(
+                net, _F.mse_loss, batch, grad_layers
+            ).items():
+                out[f'{prefix}_{k}'] = v
+
+        # Activation churn (cheap once snapshots exist — silently skip if missing)
+        if (diagnose_churn
+                and churn_before_state_dict is not None
+                and churn_after_state_dict is not None):
+            # Churn is measured on the full network output (always) plus per-layer
+            # if fau_layers are declared (consistent with what we already hook).
+            churn_layer_names = fau_layers if fau_layers else None
+            for k, v in compute_churn(
+                net, batch, churn_before_state_dict, churn_after_state_dict,
+                layer_names=churn_layer_names,
+            ).items():
+                out[f'{prefix}_{k}'] = v
+
+        # KFAC Hessian effective rank (expensive — default OFF via diagnose_kfac flag)
+        if diagnose_kfac and kfac_layers:
+            for k, v in compute_kfac_hessian_erank(net, batch, kfac_layers).items():
+                out[f'{prefix}_{k}'] = v
+
         return out
 
-    def compute_diagnostics(self, gsp_predictions_this_episode=None) -> dict:
+    def compute_diagnostics(
+        self,
+        gsp_predictions_this_episode=None,
+        actor_before_state_dict=None,
+        actor_after_state_dict=None,
+        gsp_before_state_dict=None,
+        gsp_after_state_dict=None,
+    ) -> dict:
         """Run all diagnostic functions against the frozen eval batches.
 
         Uses ``DIAGNOSTIC_PROFILE`` on each network class to determine which
@@ -701,6 +759,16 @@ class Actor(NetworkAids):
             gsp_predictions_this_episode: optional 1-D numpy array of per-timestep
                 GSP predictions from the episode, used to compute prediction
                 diversity (Shannon entropy of binned predictions).
+            actor_before_state_dict: optional state_dict snapshot of the actor
+                network taken BEFORE the most recent training step. Required for
+                churn computation (along with actor_after_state_dict). Caller
+                snapshots via ``copy.deepcopy(net.state_dict())``.
+            actor_after_state_dict: optional state_dict snapshot of the actor
+                network taken AFTER the most recent training step.
+            gsp_before_state_dict: same as actor_before_state_dict but for the
+                GSP head network.
+            gsp_after_state_dict: same as actor_after_state_dict but for the
+                GSP head network.
 
         Returns:
             Empty dict if diagnostics aren't enabled or the eval batch hasn't
@@ -715,6 +783,11 @@ class Actor(NetworkAids):
 
         out: dict = {}
 
+        # Read the three new flags (default to safe values if somehow absent)
+        diag_grad_zero = getattr(self, 'diagnose_grad_zero', True)
+        diag_churn = getattr(self, 'diagnose_churn', True)
+        diag_kfac = getattr(self, 'diagnose_kfac', False)
+
         # --- Actor network diagnostics ---
         main_net = self._main_network(self.networks)
         if main_net is not None:
@@ -722,7 +795,14 @@ class Actor(NetworkAids):
             actor_batch = T.from_numpy(self.diag_actor_eval_batch).to(device)
             profile = getattr(type(main_net), 'DIAGNOSTIC_PROFILE', None)
             if profile is not None:
-                out.update(self._diagnose_network(main_net, actor_batch, 'diag_actor', profile))
+                out.update(self._diagnose_network(
+                    main_net, actor_batch, 'diag_actor', profile,
+                    diagnose_grad_zero=diag_grad_zero,
+                    diagnose_kfac=diag_kfac,
+                    churn_before_state_dict=actor_before_state_dict,
+                    churn_after_state_dict=actor_after_state_dict,
+                    diagnose_churn=diag_churn,
+                ))
 
         # --- Critic network diagnostics (opt-in via DIAGNOSE_CRITIC) ---
         if getattr(self, 'diagnose_critic', False):
@@ -748,7 +828,14 @@ class Actor(NetworkAids):
                 gsp_batch = T.from_numpy(self.diag_gsp_eval_batch).to(gsp_device)
                 gsp_profile = getattr(type(gsp_main), 'DIAGNOSTIC_PROFILE', None)
                 if gsp_profile is not None:
-                    out.update(self._diagnose_network(gsp_main, gsp_batch, 'diag_gsp', gsp_profile))
+                    out.update(self._diagnose_network(
+                        gsp_main, gsp_batch, 'diag_gsp', gsp_profile,
+                        diagnose_grad_zero=diag_grad_zero,
+                        diagnose_kfac=diag_kfac,
+                        churn_before_state_dict=gsp_before_state_dict,
+                        churn_after_state_dict=gsp_after_state_dict,
+                        diagnose_churn=diag_churn,
+                    ))
 
             # GSP critic (opt-in)
             if getattr(self, 'diagnose_critic', False):
