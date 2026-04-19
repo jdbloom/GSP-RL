@@ -89,7 +89,17 @@ class Actor(NetworkAids):
         self.attention_gsp = attention
         
         self.gsp_network_input = gsp_input_size
-        self.gsp_network_output = gsp_output_size
+        # GSP_OUTPUT_KIND overrides the gsp_output_size kwarg when a non-default
+        # kind is configured. The effective output size is always read from
+        # self.gsp_output_size_effective (set in Hyperparameters.__init__ by the
+        # GSP_OUTPUT_KIND flag). For backward compat, 'delta_theta_1d' leaves the
+        # effective size at 1 and the gsp_output_size kwarg wins via the fallback.
+        _effective = getattr(self, 'gsp_output_size_effective', gsp_output_size)
+        if getattr(self, 'gsp_output_kind', 'delta_theta_1d') != 'delta_theta_1d':
+            self.gsp_network_output = _effective
+        else:
+            # Default path: use the kwarg (legacy behavior).
+            self.gsp_network_output = gsp_output_size
         self.gsp_min_max_action = gsp_min_max_action
         self.gsp_look_back = gsp_look_back
         self.gsp_sequence_length = gsp_sequence_length
@@ -122,7 +132,10 @@ class Actor(NetworkAids):
 
         self.network_input_size = self.input_size
         if self.gsp:
-            self.network_input_size += self.gsp_network_output 
+            # For multi-dim GSP output (gsp_output_kind != delta_theta_1d),
+            # the actor's augmented obs grows by the full output vector width,
+            # not just 1. agent.py's make_agent_state handles the concatenation.
+            self.network_input_size += self.gsp_network_output
         if self.attention_gsp:  
             self.attention_observation = [[0 for _ in range(self.gsp_network_input)] for _ in range(self.gsp_sequence_length)]
         elif self.recurrent_gsp:

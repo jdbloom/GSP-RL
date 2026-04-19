@@ -259,6 +259,37 @@ class Hyperparameters:
         self.gsp_prediction_target = str(config.get('GSP_PREDICTION_TARGET', 'delta_theta'))
         self.gsp_prediction_horizon = int(config.get('GSP_PREDICTION_HORIZON', 5))
 
+        # GSP_OUTPUT_KIND — controls how many targets the GSP head predicts.
+        # Motivated by He 2509.22335 Theorem 6.2: rank(Hessian) <= P - k_τ*(I+O+1).
+        # Increasing output dim O directly raises the achievable Hessian rank,
+        # potentially breaking the rank-1 collapse pattern observed with O=1.
+        #
+        # Supported values:
+        #   'delta_theta_1d'        (default) O=1  — legacy Δθ scalar, backward compat
+        #   'future_prox_1d'                  O=1  — per-agent future proximity scalar
+        #   'cyl_kinematics_3d'               O=3  — (cyl_Δx, cyl_Δy, cyl_Δθ) per step
+        #   'cyl_kinematics_goal_4d'          O=4  — above + group_centroid_Δ_to_goal
+        #   'time_to_goal_1d'                 O=1  — remaining steps to success (or 0)
+        #
+        # gsp_output_size_effective is the O to use when building the GSP head.
+        # The legacy gsp_output_size kwarg (from config['GSP_OUTPUT_SIZE']) is kept
+        # for backward compat on non-GSP_OUTPUT_KIND runs; this field overrides it
+        # when GSP_OUTPUT_KIND is set to a non-default value.
+        _GSP_OUTPUT_KIND_SIZES = {
+            'delta_theta_1d': 1,
+            'future_prox_1d': 1,
+            'cyl_kinematics_3d': 3,
+            'cyl_kinematics_goal_4d': 4,
+            'time_to_goal_1d': 1,
+        }
+        self.gsp_output_kind = str(config.get('GSP_OUTPUT_KIND', 'delta_theta_1d'))
+        if self.gsp_output_kind not in _GSP_OUTPUT_KIND_SIZES:
+            raise ValueError(
+                f"Unknown GSP_OUTPUT_KIND '{self.gsp_output_kind}'. "
+                f"Valid values: {list(_GSP_OUTPUT_KIND_SIZES)}"
+            )
+        self.gsp_output_size_effective = _GSP_OUTPUT_KIND_SIZES[self.gsp_output_kind]
+
         # Weight initialization scheme for the GSP head's hidden layers.
         # 'fanin' (default) preserves legacy behavior for all in-flight runs.
         # 'kaiming' uses Kaiming He normal init — see DDPGActorNetwork docstring.
