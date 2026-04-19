@@ -148,8 +148,18 @@ class DDPGActorNetwork(nn.Module):
         if self.init_scheme == "kaiming":
             T.nn.init.kaiming_normal_(self.fc1.weight, mode='fan_in', nonlinearity='relu')
             T.nn.init.kaiming_normal_(self.fc2.weight, mode='fan_in', nonlinearity='relu')
+        elif self.init_scheme == "fanin_fixed":
+            # Correct fan-in: index size[1] = in_features (PyTorch Linear (out, in) convention).
+            # Legacy "fanin" scheme uses size[0] which is the OUT dim — that's the bug we're fixing.
+            self.fc1.weight.data = fanin_init(
+                self.fc1.weight.data.size(), fanin=self.fc1.weight.data.size()[1]
+            )
+            self.fc2.weight.data = fanin_init(
+                self.fc2.weight.data.size(), fanin=self.fc2.weight.data.size()[1]
+            )
         else:
-            # Default: fanin uniform (legacy behavior — preserves all existing runs)
+            # Default: fanin uniform (legacy behavior — preserves all existing runs).
+            # NOTE: misnamed — actually uses size[0] = OUT_features as fan-in.
             self.fc1.weight.data = fanin_init(self.fc1.weight.data.size())
             self.fc2.weight.data = fanin_init(self.fc2.weight.data.size())
         self.mu.weight.data.uniform_(-init_w, init_w)

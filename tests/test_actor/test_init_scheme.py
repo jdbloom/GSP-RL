@@ -126,6 +126,62 @@ class TestKaimingFAU:
         )
 
 
+class TestFaninFixed:
+    """fanin_fixed uses size[1] (the actual in_features) rather than the buggy size[0]."""
+
+    def test_fanin_fixed_fc1_norm_exceeds_legacy_fanin(self):
+        """fanin_fixed for fc1 (Linear(6, 400)) should be ~8x wider than legacy fanin.
+
+        legacy fanin uses size[0] = 400 → std ≈ 0.029
+        fanin_fixed uses size[1] = 6 → std ≈ 0.236
+        Expected norm ratio ≈ sqrt(400/6) ≈ 8.16x.
+        """
+        ratios = []
+        for seed in range(20):
+            legacy = _make_actor("fanin", seed=seed)
+            fixed = _make_actor("fanin_fixed", seed=seed)
+            ln = legacy.fc1.weight.data.norm().item()
+            fn = fixed.fc1.weight.data.norm().item()
+            if ln > 1e-8:
+                ratios.append(fn / ln)
+        avg = sum(ratios) / len(ratios)
+        assert 6.0 < avg < 11.0, (
+            f"Mean fanin_fixed/fanin fc1-norm ratio {avg:.3f} outside expected ~8x band [6.0, 11.0]"
+        )
+
+    def test_fanin_fixed_fc1_fau_lower_than_legacy_fanin(self):
+        """On uniform [0, 0.5] inputs, fanin_fixed should have fewer dead fc1 units than legacy."""
+        legacy = _make_actor("fanin", seed=42)
+        fixed = _make_actor("fanin_fixed", seed=42)
+        device = legacy.device
+        batch = _realistic_batch(n=1024, device=device)
+        legacy_fau = compute_fau(legacy, batch, layer_names=["fc1"])["fau_fc1"]
+        fixed_fau = compute_fau(fixed, batch, layer_names=["fc1"])["fau_fc1"]
+        assert fixed_fau < legacy_fau, (
+            f"fanin_fixed fc1 FAU ({fixed_fau:.3f}) should be < legacy fanin FAU "
+            f"({legacy_fau:.3f}) on positive-bounded inputs"
+        )
+
+    def test_fanin_fixed_fc1_norm_below_kaiming(self):
+        """fanin_fixed should sit between legacy fanin and kaiming on weight magnitude.
+
+        Kaiming uses std=sqrt(2/fan_in) → ~sqrt(2)≈1.41x wider than fanin_fixed
+        for matched fan-in. So fanin_fixed < kaiming on Frobenius norm.
+        """
+        ratios = []
+        for seed in range(10):
+            fixed = _make_actor("fanin_fixed", seed=seed)
+            kaiming = _make_actor("kaiming", seed=seed)
+            f_n = fixed.fc1.weight.data.norm().item()
+            k_n = kaiming.fc1.weight.data.norm().item()
+            if f_n > 1e-8:
+                ratios.append(k_n / f_n)
+        avg = sum(ratios) / len(ratios)
+        assert 1.1 < avg < 2.5, (
+            f"Mean kaiming/fanin_fixed fc1-norm ratio {avg:.3f} outside expected band [1.1, 2.5]"
+        )
+
+
 class TestBackwardCompat:
     """Default init_scheme='fanin' must produce identical behavior to legacy networks."""
 
