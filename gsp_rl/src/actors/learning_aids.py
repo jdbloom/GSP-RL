@@ -272,6 +272,16 @@ class Hyperparameters:
         # Default 0.0 → strict no-op, all historical runs unaffected.
         self.gsp_l2er_lambda = float(config.get('GSP_L2ER_LAMBDA', 0.0))
 
+        # C-CHAIN churn-minimizing regularization on the GSP head
+        # (Tang et al. 2506.00592, ICML 2025). When > 0, after the main MSE
+        # (+ optional L2-ER) optimizer step, a second backward+step penalizes
+        # the L2 change in head outputs on the same mini-batch:
+        #   L_cchain = λ * F.mse_loss(head(states), pre_step_outputs.detach())
+        # This counteracts plasticity loss by limiting how much each mini-batch
+        # shifts the network's function on the training distribution.
+        # Default 0.0 → strict no-op; all historical runs are unaffected.
+        self.gsp_cchain_lambda = float(config.get('GSP_CCHAIN_LAMBDA', 0.0))
+
         self.noise = config['NOISE']
         self.update_actor_iter = config['UPDATE_ACTOR_ITER']
         self.warmup = config['WARMUP']
@@ -895,9 +905,41 @@ class NetworkAids(Hyperparameters):
                 # gsp_l2er_loss returns -(erank1+erank2); negating yields erank_sum > 0.
                 loss = loss - l2er_lambda * l2er_erank_sum
 
+        # Snapshot head outputs BEFORE the MSE backward+step.
+        # We capture pre_outputs here (detached, no graph) so that after the
+        # optimizer mutates the weights we can measure how much the function
+        # changed on this same batch. This is C-CHAIN's "reference batch"
+        # snapshot — Tang et al. 2506.00592 Eq. (3).
+        cchain_lambda = float(getattr(self, 'gsp_cchain_lambda', 0.0))
+        if cchain_lambda > 0.0 and not recurrent:
+            with T.no_grad():
+                pre_outputs = networks['actor'].forward(states).detach().clone()
+
         loss.backward()
         _check_nan(loss, f"GSP MSE loss at step {networks['learn_step_counter']}")
         networks['actor'].optimizer.step()
+
+        # C-CHAIN auxiliary step (two-step formulation).
+        # After the MSE optimizer step, re-run the head on the same batch and
+        # penalize the L2 distance from the pre-step snapshot. A second
+        # backward+step is used so the C-CHAIN gradient does NOT mix with the
+        # MSE gradient inside the same computation graph — this matches the
+        # paper's "run optimizer on churn loss separately" interpretation and
+        # avoids modifying the MSE loss value that gets logged.
+        # Guard: recurrent path skipped (RDDPGActorNetwork forward signature
+        # differs and its use case does not yet have plasticity concerns).
+        if cchain_lambda > 0.0 and not recurrent:
+            post_outputs = networks['actor'].forward(states)
+            if post_outputs.dim() != pre_outputs.dim():
+                # Normalize shape (batch,) → (batch, 1) to match pre_outputs
+                post_outputs = post_outputs.unsqueeze(-1) if post_outputs.dim() == 1 else post_outputs
+                pre_outputs = pre_outputs.unsqueeze(-1) if pre_outputs.dim() == 1 else pre_outputs
+            cchain_loss = cchain_lambda * F.mse_loss(post_outputs, pre_outputs)
+            networks['actor'].optimizer.zero_grad()
+            cchain_loss.backward()
+            _check_nan(cchain_loss, f"GSP C-CHAIN loss at step {networks['learn_step_counter']}")
+            networks['actor'].optimizer.step()
+
         networks['learn_step_counter'] += 1
         return loss.item()
 
