@@ -138,6 +138,11 @@ class Hyperparameters:
         self.diagnostics_freeze_episode = int(config.get('DIAGNOSTICS_FREEZE_EPISODE', 50))
         self.diagnostics_cadence = int(config.get('DIAGNOSTICS_CADENCE', 10))
         self.diagnostics_batch_size = int(config.get('DIAGNOSTICS_BATCH_SIZE', 1024))
+        # Optional critic-side diagnostics (weight norms). Default OFF — adds latency
+        # and most plasticity signals of interest are on the actor/policy network.
+        # Set to True for targeted investigations (e.g., checking whether critic
+        # weight norms grow unboundedly during DDPG/TD3 training).
+        self.diagnose_critic = bool(config.get('DIAGNOSE_CRITIC', False))
 
         # H-14 GSP-minus ablation flag. When True, the GSP head still runs (gets
         # trained, produces predictions) but those predictions are REPLACED WITH

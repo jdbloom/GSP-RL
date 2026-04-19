@@ -564,8 +564,127 @@ class Actor(NetworkAids):
             gsp_idx = rng.choice(len(pool), self.diagnostics_batch_size, replace=False)
             self.diag_gsp_eval_batch = pool[gsp_idx]
 
+    # ---------------------------------------------------------------------------------
+    # Diagnostics helpers
+    # ---------------------------------------------------------------------------------
+
+    def _main_network(self, networks_dict: dict):
+        """Return the primary network from ``networks_dict`` based on learning_scheme.
+
+        - DQN, DDQN  -> ``networks_dict['q_eval']``
+        - DDPG, TD3, RDDPG -> ``networks_dict['actor']``
+        - attention   -> ``networks_dict.get('actor') or networks_dict.get('attention')``
+
+        Returns ``None`` if the expected key is absent.
+        """
+        scheme = networks_dict.get('learning_scheme', '')
+        if scheme in ('DQN', 'DDQN'):
+            return networks_dict.get('q_eval')
+        if scheme in ('DDPG', 'TD3', 'RDDPG'):
+            return networks_dict.get('actor')
+        if scheme == 'attention':
+            return networks_dict.get('actor') or networks_dict.get('attention')
+        return None
+
+    def _critic_network(self, networks_dict: dict):
+        """Return the primary critic from ``networks_dict`` for DDPG/TD3/RDDPG.
+
+        - DDPG, RDDPG -> ``networks_dict.get('critic')``
+        - TD3          -> ``networks_dict.get('critic_1')`` (first critic only;
+                          see TD3CriticNetwork.DIAGNOSTIC_PROFILE for limitation note)
+        - Others       -> ``None``
+        """
+        scheme = networks_dict.get('learning_scheme', '')
+        if scheme in ('DDPG', 'RDDPG'):
+            return networks_dict.get('critic')
+        if scheme == 'TD3':
+            return networks_dict.get('critic_1')
+        return None
+
+    @staticmethod
+    def _diagnose_network(
+        net,
+        batch: T.Tensor,
+        prefix: str,
+        profile: dict,
+    ) -> dict:
+        """Run diagnostics on ``net`` using its ``DIAGNOSTIC_PROFILE``.
+
+        Dispatches to the appropriate diagnostic functions based on the profile
+        fields. All diagnostic imports are deferred to this method.
+
+        Args:
+            net: ``nn.Module`` with a ``DIAGNOSTIC_PROFILE`` class attribute.
+            batch: Eval batch tensor, typically ``(N, input_dim)``.
+            prefix: Key prefix for the output dict (e.g., ``'diag_actor'``).
+            profile: The ``DIAGNOSTIC_PROFILE`` dict from the network class (or
+                fetched from the instance). Must have keys: ``fau_layers``,
+                ``wnorm_layers``, ``has_penultimate``, ``output_kind``.
+
+        Returns:
+            Dict of ``{prefix + '_' + metric_key: float}`` entries.
+        """
+        from gsp_rl.src.actors.diagnostics import (
+            compute_fau,
+            compute_overactive_fau,
+            compute_weight_norms,
+            compute_effective_rank,
+            compute_q_action_gap,
+            compute_hidden_norm,
+            compute_attention_entropy,
+        )
+
+        out: dict = {}
+        fau_layers = profile.get('fau_layers', [])
+        wnorm_layers = profile.get('wnorm_layers', [])
+        has_penultimate = profile.get('has_penultimate', False)
+        output_kind = profile.get('output_kind', '')
+
+        # FAU and overactive FAU — only if ReLU layers declared
+        if fau_layers:
+            for k, v in compute_fau(net, batch, fau_layers).items():
+                out[f'{prefix}_{k}'] = v
+            for k, v in compute_overactive_fau(net, batch, fau_layers).items():
+                out[f'{prefix}_{k}'] = v
+
+        # Weight norms — always run if layers declared
+        if wnorm_layers:
+            for k, v in compute_weight_norms(net, wnorm_layers).items():
+                out[f'{prefix}_{k}'] = v
+
+        # Effective rank — only for networks with a penultimate() method
+        if has_penultimate and hasattr(net, 'penultimate'):
+            out[f'{prefix}_erank_penult'] = compute_effective_rank(
+                net, batch, penultimate_fn='penultimate'
+            )
+
+        # Q-action gap — only for discrete Q-value outputs
+        if output_kind == 'q_values':
+            for k, v in compute_q_action_gap(net, batch).items():
+                # Historical key schema: top-level 'diag_q_*' for actor Q-gap,
+                # 'diag_gsp_q_*' for GSP Q-gap. We use prefix stripping to maintain
+                # backward compat: replace 'diag_actor_' prefix with 'diag_' for the
+                # q-gap keys so DDQN runs (j142, j150-170) see the same key names as before.
+                if prefix == 'diag_actor':
+                    out[f'diag_{k}'] = v
+                else:
+                    out[f'{prefix}_{k}'] = v
+
+        # LSTM hidden norm — for LSTM-based encoders
+        if output_kind == 'lstm_hidden':
+            out[f'{prefix}_hidden_norm'] = compute_hidden_norm(net, batch)
+
+        # Attention entropy — for attention-based encoders
+        if output_kind == 'attention':
+            out[f'{prefix}_attention_entropy'] = compute_attention_entropy(net, batch)
+
+        return out
+
     def compute_diagnostics(self, gsp_predictions_this_episode=None) -> dict:
         """Run all diagnostic functions against the frozen eval batches.
+
+        Uses ``DIAGNOSTIC_PROFILE`` on each network class to determine which
+        metrics apply. Dispatches via ``_diagnose_network``.
 
         Returns a dict of namespaced scalar metrics ready to pass to
         ``HDF5Logger.record_episode_diagnostics``. Keys prefixed ``diag_``.
@@ -579,58 +698,63 @@ class Actor(NetworkAids):
             Empty dict if diagnostics aren't enabled or the eval batch hasn't
             been frozen yet; otherwise a dict with the full diagnostic set.
         """
+        from gsp_rl.src.actors.diagnostics import compute_gsp_pred_diversity
+
         if not self.diagnostics_enabled:
             return {}
         if not hasattr(self, 'diag_actor_eval_batch') or self.diag_actor_eval_batch is None:
             return {}
-        # Imports deferred so that users who don't enable diagnostics don't pay
-        # the import cost.
-        from gsp_rl.src.actors.diagnostics import (
-            compute_fau,
-            compute_overactive_fau,
-            compute_weight_norms,
-            compute_effective_rank,
-            compute_q_action_gap,
-            compute_gsp_pred_diversity,
-        )
 
         out: dict = {}
-        q_eval = self.networks.get('q_eval')
-        device = next(q_eval.parameters()).device if q_eval is not None else T.device('cpu')
-        actor_batch = T.from_numpy(self.diag_actor_eval_batch).to(device)
 
-        if q_eval is not None:
-            for k, v in compute_fau(q_eval, actor_batch, ['fc1', 'fc2']).items():
-                out[f'diag_actor_{k}'] = v
-            for k, v in compute_overactive_fau(q_eval, actor_batch, ['fc1', 'fc2']).items():
-                out[f'diag_actor_{k}'] = v
-            for k, v in compute_weight_norms(q_eval, ['fc1', 'fc2', 'fc3']).items():
-                out[f'diag_actor_{k}'] = v
-            if hasattr(q_eval, 'penultimate'):
-                out['diag_actor_erank_penult'] = compute_effective_rank(
-                    q_eval, actor_batch, penultimate_fn='penultimate'
-                )
-            for k, v in compute_q_action_gap(q_eval, actor_batch).items():
-                out[f'diag_{k}'] = v
+        # --- Actor network diagnostics ---
+        main_net = self._main_network(self.networks)
+        if main_net is not None:
+            device = next(main_net.parameters()).device
+            actor_batch = T.from_numpy(self.diag_actor_eval_batch).to(device)
+            profile = getattr(type(main_net), 'DIAGNOSTIC_PROFILE', None)
+            if profile is not None:
+                out.update(self._diagnose_network(main_net, actor_batch, 'diag_actor', profile))
 
-        # GSP head diagnostics — only if the head exists AND we captured gsp_obs pool
-        if self.gsp_networks is not None and self.diag_gsp_eval_batch is not None:
-            gsp_head = self.gsp_networks.get('actor') or self.gsp_networks.get('q_eval')
-            if gsp_head is not None:
-                gsp_device = next(gsp_head.parameters()).device
+        # --- Critic network diagnostics (opt-in via DIAGNOSE_CRITIC) ---
+        if getattr(self, 'diagnose_critic', False):
+            critic_net = self._critic_network(self.networks)
+            if critic_net is not None:
+                c_device = next(critic_net.parameters()).device
+                # Critic takes (state, action) but diagnostics probe state-only forward;
+                # we skip critic FAU/erank (critic forward signature differs) and only
+                # run weight norms, which don't require a forward pass.
+                c_profile = getattr(type(critic_net), 'DIAGNOSTIC_PROFILE', None)
+                if c_profile is not None:
+                    from gsp_rl.src.actors.diagnostics import compute_weight_norms
+                    for k, v in compute_weight_norms(
+                        critic_net, c_profile.get('wnorm_layers', [])
+                    ).items():
+                        out[f'diag_critic_{k}'] = v
+
+        # --- GSP head diagnostics ---
+        if self.gsp_networks is not None and hasattr(self, 'diag_gsp_eval_batch') and self.diag_gsp_eval_batch is not None:
+            gsp_main = self._main_network(self.gsp_networks)
+            if gsp_main is not None:
+                gsp_device = next(gsp_main.parameters()).device
                 gsp_batch = T.from_numpy(self.diag_gsp_eval_batch).to(gsp_device)
-                for k, v in compute_fau(gsp_head, gsp_batch, ['fc1', 'fc2']).items():
-                    out[f'diag_gsp_{k}'] = v
-                for k, v in compute_overactive_fau(gsp_head, gsp_batch, ['fc1', 'fc2']).items():
-                    out[f'diag_gsp_{k}'] = v
-                for k, v in compute_weight_norms(gsp_head, ['fc1', 'fc2', 'mu']).items():
-                    out[f'diag_gsp_{k}'] = v
-                if hasattr(gsp_head, 'penultimate'):
-                    out['diag_gsp_erank_penult'] = compute_effective_rank(
-                        gsp_head, gsp_batch, penultimate_fn='penultimate'
-                    )
+                gsp_profile = getattr(type(gsp_main), 'DIAGNOSTIC_PROFILE', None)
+                if gsp_profile is not None:
+                    out.update(self._diagnose_network(gsp_main, gsp_batch, 'diag_gsp', gsp_profile))
 
-        # GSP prediction diversity (this-episode entropy, not eval-batch based)
+            # GSP critic (opt-in)
+            if getattr(self, 'diagnose_critic', False):
+                gsp_critic = self._critic_network(self.gsp_networks)
+                if gsp_critic is not None:
+                    gc_profile = getattr(type(gsp_critic), 'DIAGNOSTIC_PROFILE', None)
+                    if gc_profile is not None:
+                        from gsp_rl.src.actors.diagnostics import compute_weight_norms
+                        for k, v in compute_weight_norms(
+                            gsp_critic, gc_profile.get('wnorm_layers', [])
+                        ).items():
+                            out[f'diag_gsp_critic_{k}'] = v
+
+        # --- GSP prediction diversity (this-episode entropy, not eval-batch based) ---
         if gsp_predictions_this_episode is not None:
             preds = np.asarray(gsp_predictions_this_episode, dtype=np.float32).ravel()
             if preds.size > 0:

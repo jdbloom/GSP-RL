@@ -156,7 +156,21 @@ class AttentionEncoder(nn.Module):
         layers: ModuleList with a single TransformerBlock.
         fc_out: Linear(embed_size * max_length, output_size) on flattened output.
         name: "Attention_Encoder" for checkpoint files.
+        DIAGNOSTIC_PROFILE: Declarative profile consumed by Actor._diagnose_network.
+            fau_layers is empty — the word_embedding ReLU is inside a Sequential
+            and not directly accessible as a named top-level submodule by the FAU
+            hook mechanism. Weight norms cover fc_out (the final projection).
+            output_kind 'attention' triggers compute_attention_entropy.
+            has_penultimate is False — the flattened transformer output is not a
+            standard penultimate layer suitable for effective-rank analysis.
     """
+
+    DIAGNOSTIC_PROFILE = {
+        'fau_layers':      [],
+        'wnorm_layers':    ['fc_out'],
+        'has_penultimate': False,
+        'output_kind':     'attention',
+    }
     def __init__(
             self,
             input_size: int,

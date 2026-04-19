@@ -32,7 +32,15 @@ class TD3ActorNetwork(nn.Module):
     Attributes:
         min_max_action: Action space bound for tanh scaling.
         name: Formatted as '{name}_{id}_TD3' for checkpoint files.
+        DIAGNOSTIC_PROFILE: Declarative profile consumed by Actor._diagnose_network.
     """
+
+    DIAGNOSTIC_PROFILE = {
+        'fau_layers':      ['fc1', 'fc2'],
+        'wnorm_layers':    ['fc1', 'fc2', 'mu'],
+        'has_penultimate': True,
+        'output_kind':     'continuous_action',
+    }
     def __init__(
             self,
             id: int,
@@ -87,6 +95,13 @@ class TD3ActorNetwork(nn.Module):
 
         return mu
 
+    def penultimate(self, state: T.Tensor) -> T.Tensor:
+        """Return post-ReLU activations of fc2 — the feature vector immediately
+        before the output linear (mu). Used by diagnostics (effective rank).
+        """
+        prob = F.relu(self.fc1(state))
+        return F.relu(self.fc2(prob))
+
     def save_checkpoint(self, path: str, intention: bool = False) -> None:
         """ Save Model """
         network_name = self.name
@@ -119,7 +134,18 @@ class TD3CriticNetwork(nn.Module):
 
     Attributes:
         name: Formatted as '{name}_{id}_TD3' for checkpoint files.
+        DIAGNOSTIC_PROFILE: Declarative profile consumed by Actor._diagnose_network.
+            Limitation: TD3 has two critic instances (critic_1, critic_2); diagnostics
+            are applied only to critic_1 when DIAGNOSE_CRITIC is enabled. This is
+            documented as a known limitation — a follow-up can extend to both critics.
     """
+
+    DIAGNOSTIC_PROFILE = {
+        'fau_layers':      ['fc1', 'fc2'],
+        'wnorm_layers':    ['fc1', 'fc2', 'q1'],
+        'has_penultimate': False,
+        'output_kind':     'q_scalar',
+    }
     def __init__(
             self,
             id: int,

@@ -40,7 +40,15 @@ class DDPGActorNetwork(nn.Module):
     Attributes:
         min_max_action: Action space bound for tanh scaling.
         name: Formatted as '{name}_{id}_DDPG' for checkpoint files.
+        DIAGNOSTIC_PROFILE: Declarative profile consumed by Actor._diagnose_network.
     """
+
+    DIAGNOSTIC_PROFILE = {
+        'fau_layers':      ['fc1', 'fc2'],
+        'wnorm_layers':    ['fc1', 'fc2', 'mu'],
+        'has_penultimate': True,
+        'output_kind':     'continuous_action',
+    }
     def __init__(
             self,
             id: int,
@@ -203,7 +211,15 @@ class DDPGCriticNetwork(nn.Module):
 
     Attributes:
         name: Formatted as '{name}_{id}_DDPG' for checkpoint files.
+        DIAGNOSTIC_PROFILE: Declarative profile consumed by Actor._diagnose_network.
     """
+
+    DIAGNOSTIC_PROFILE = {
+        'fau_layers':      ['fc1', 'fc2'],
+        'wnorm_layers':    ['fc1', 'fc2', 'q'],
+        'has_penultimate': False,
+        'output_kind':     'q_scalar',
+    }
     def __init__(self,
                  id: int,
                  lr: float,

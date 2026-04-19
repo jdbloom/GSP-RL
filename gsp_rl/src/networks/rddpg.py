@@ -29,7 +29,18 @@ class RDDPGActorNetwork(nn.Module):
     Attributes:
         ee: EnvironmentEncoder (LSTM-based).
         actor: DDPGActorNetwork.
+        DIAGNOSTIC_PROFILE: Declarative profile consumed by Actor._diagnose_network.
+            fau_layers and wnorm_layers refer to the inner DDPGActorNetwork layers.
+            LSTM cell weights are excluded from FAU (not ReLU units) — tracked by
+            separate hidden-norm diagnostic via EnvironmentEncoder in a future followup.
     """
+
+    DIAGNOSTIC_PROFILE = {
+        'fau_layers':      ['actor.fc1', 'actor.fc2'],
+        'wnorm_layers':    ['actor.fc1', 'actor.fc2', 'actor.mu'],
+        'has_penultimate': True,
+        'output_kind':     'continuous_action',
+    }
     def __init__(self, environmental_encoder, ddpg_actor):
         super().__init__()
         self.ee = environmental_encoder
@@ -56,7 +67,32 @@ class RDDPGActorNetwork(nn.Module):
         encoding, hidden_out = self.ee(x, hidden=hidden)
         mu = self.actor(encoding)
         return mu, hidden_out
-    
+
+    def penultimate(self, x):
+        """Return post-ReLU activations of the inner DDPGActorNetwork's fc2.
+
+        For diagnostics: each row in x is treated as a single-step sequence
+        (seq_len=1) so the LSTM produces one encoding per sample. The DDPG
+        actor's penultimate layer is then applied to those encodings.
+
+        Args:
+            x: State tensor of shape (N, input_size). Each row is wrapped as a
+               sequence of length 1 before passing through the LSTM encoder.
+
+        Returns:
+            Tensor of shape (N, fc2_dims) — penultimate features of inner actor.
+        """
+        # Unsqueeze to (N, 1, input_size) — batch of single-step sequences.
+        if x.dim() == 2:
+            x_seq = x.unsqueeze(1)
+        else:
+            x_seq = x
+        encoding, _ = self.ee(x_seq, hidden=None)
+        # encoding shape: (N, 1, output_size) — take last timestep
+        if encoding.dim() == 3:
+            encoding = encoding[:, -1, :]  # (N, output_size)
+        return self.actor.penultimate(encoding)
+
     def save_checkpoint(self, path: str, intention: bool = False) -> None:
         path = path+'_recurrent'
         self.ee.save_checkpoint(path, intention)
@@ -78,7 +114,16 @@ class RDDPGCriticNetwork(nn.Module):
     Attributes:
         ee: EnvironmentEncoder (LSTM-based).
         critic: DDPGCriticNetwork.
+        DIAGNOSTIC_PROFILE: Declarative profile consumed by Actor._diagnose_network.
+            fau_layers and wnorm_layers refer to the inner DDPGCriticNetwork layers.
     """
+
+    DIAGNOSTIC_PROFILE = {
+        'fau_layers':      ['critic.fc1', 'critic.fc2'],
+        'wnorm_layers':    ['critic.fc1', 'critic.fc2', 'critic.q'],
+        'has_penultimate': False,
+        'output_kind':     'q_scalar',
+    }
     def __init__(self, environmental_encoder, ddpg_critic):
         super().__init__()
         self.ee = environmental_encoder

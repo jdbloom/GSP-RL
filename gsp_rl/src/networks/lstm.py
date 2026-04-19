@@ -27,7 +27,19 @@ class EnvironmentEncoder(nn.Module):
         ee: LSTM(embedding_size, hidden_size, num_layers, batch_first=True).
         meta_layer: Linear(hidden_size, output_size).
         name: "Enviroment_Encoder" (historical typo preserved).
+        DIAGNOSTIC_PROFILE: Declarative profile consumed by Actor._diagnose_network.
+            fau_layers is empty because LSTM gates are not plain ReLU units.
+            wnorm_layers covers the LSTM input/hidden weight matrices.
+            output_kind 'lstm_hidden' triggers compute_hidden_norm in the diagnostics
+            dispatch rather than Q-value or action-based metrics.
     """
+
+    DIAGNOSTIC_PROFILE = {
+        'fau_layers':      [],
+        'wnorm_layers':    ['ee.weight_ih_l0', 'ee.weight_hh_l0'],
+        'has_penultimate': False,
+        'output_kind':     'lstm_hidden',
+    }
     def __init__(
             self,
             input_size: int,

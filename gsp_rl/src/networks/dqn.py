@@ -26,7 +26,15 @@ class DQN(nn.Module):
         optimizer: Adam with weight_decay=1e-4.
         loss: MSELoss instance for TD error computation.
         device: Auto-detected cuda:0 or cpu.
+        DIAGNOSTIC_PROFILE: Declarative profile consumed by Actor._diagnose_network.
     """
+
+    DIAGNOSTIC_PROFILE = {
+        'fau_layers':      ['fc1', 'fc2'],
+        'wnorm_layers':    ['fc1', 'fc2', 'fc3'],
+        'has_penultimate': True,
+        'output_kind':     'q_values',
+    }
     def __init__(
             self,
             id: int,
