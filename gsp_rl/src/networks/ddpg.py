@@ -46,6 +46,7 @@ class DDPGActorNetwork(nn.Module):
     DIAGNOSTIC_PROFILE = {
         'fau_layers':      ['fc1', 'fc2'],
         'wnorm_layers':    ['fc1', 'fc2', 'mu'],
+        'grad_layers':     ['fc1', 'fc2', 'mu'],
         'has_penultimate': True,
         'output_kind':     'continuous_action',
     }

@@ -32,6 +32,7 @@ class DDQN(nn.Module):
     DIAGNOSTIC_PROFILE = {
         'fau_layers':      ['fc1', 'fc2'],
         'wnorm_layers':    ['fc1', 'fc2', 'fc3'],
+        'grad_layers':     ['fc1', 'fc2', 'fc3'],
         'has_penultimate': True,
         'output_kind':     'q_values',
     }
