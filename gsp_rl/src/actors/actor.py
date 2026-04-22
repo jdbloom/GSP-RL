@@ -582,8 +582,23 @@ class Actor(NetworkAids):
         self.diag_gsp_eval_batch = None
         if gsp_obs_pool is not None and len(gsp_obs_pool) >= self.diagnostics_batch_size:
             pool = np.asarray(gsp_obs_pool, dtype=np.float32)
-            gsp_idx = rng.choice(len(pool), self.diagnostics_batch_size, replace=False)
-            self.diag_gsp_eval_batch = pool[gsp_idx]
+            # Validate shape before committing — a shape-mismatched pool would later
+            # crash in compute_diagnostics → GSP head forward, 40+ min into a run.
+            # Fail loud with a printed warning and skip GSP head diagnostics rather
+            # than crash the whole training subprocess. The actor diagnostics still
+            # run. See docs/research/2026-04-22-b008-diag-pool-shape-postmortem.md.
+            expected = int(getattr(self, 'gsp_network_input', 0))
+            if pool.ndim != 2 or (expected > 0 and pool.shape[1] != expected):
+                print(
+                    f"[freeze_diagnostic_batch] WARN: gsp_obs_pool shape "
+                    f"{pool.shape} does not match GSP head input size "
+                    f"({expected},); skipping GSP head diagnostics for the rest "
+                    f"of this run. Fix the caller to supply shape "
+                    f"(N, {expected}) samples."
+                )
+            else:
+                gsp_idx = rng.choice(len(pool), self.diagnostics_batch_size, replace=False)
+                self.diag_gsp_eval_batch = pool[gsp_idx]
 
     # ---------------------------------------------------------------------------------
     # Diagnostics helpers
