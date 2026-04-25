@@ -337,7 +337,13 @@ class Actor(NetworkAids):
             'id':self.id,
             'input_size':self.gsp_network_input,
             'output_size':self.gsp_network_output,
-            'lr': self.lr,
+            # Phase 4: use gsp_head_lr (independent of trunk/actor LR).
+            # Default: same as self.lr (from config['LR']), so existing batches are
+            # bit-for-bit identical. Override via GSP_HEAD_LR in the experiment YAML.
+            # The GSP critic LR intentionally stays at self.lr — only the actor/head
+            # that produces predictions (and is trained via supervised MSE) gets the
+            # independent rate.
+            'lr': getattr(self, 'gsp_head_lr', self.lr),
             'min_max_action':self.min_max_action,
             # Task 0 ablation knobs — defaults preserve legacy behavior exactly.
             # Only the GSP-head actor network receives these; the main policy actor

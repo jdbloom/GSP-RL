@@ -177,6 +177,15 @@ class Hyperparameters:
         self.beta = config['BETA']
         self.lr = config['LR']
 
+        # Phase 4 — independent GSP head learning rate.
+        # Default: same value as the trunk/actor LR (config['LR']), preserving
+        # exact legacy behavior for all existing batches. When set to a different
+        # value, the GSP prediction head's Adam optimizer uses gsp_head_lr while
+        # the main action-network optimizer continues to use self.lr.
+        # Only affects the GSP actor/head network; the GSP critic and target
+        # networks are unchanged (they remain tied to self.lr).
+        self.gsp_head_lr = float(config.get('GSP_HEAD_LR', self.lr))
+
         self.epsilon = config['EPSILON']
         self.eps_min = config['EPS_MIN']
         self.eps_dec = config['EPS_DEC']
