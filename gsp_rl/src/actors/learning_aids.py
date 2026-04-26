@@ -247,6 +247,27 @@ class Hyperparameters:
         # itself). Default False preserves legacy behavior.
         self.gsp_zero_out_signal = bool(config.get('GSP_ZERO_OUT_SIGNAL', False))
 
+        # H-phase4-6 shuffled-prediction ablation flag (Phase 4 W2c).
+        # When True, the prediction tensor produced by the GSP head is randomly
+        # permuted along the batch/agent dimension before being concatenated into
+        # the actor's augmented observation. This keeps the BROADCAST CHANNEL
+        # intact (same shapes, same wire format) while destroying the information
+        # content of the predictions that the actor actually sees.
+        #
+        # Design choice: permutation happens at the actor-input boundary (all
+        # agents receive permuted values). An alternative would be to permute only
+        # the "other agents' predictions" while keeping self_prev_gsp intact, but
+        # that requires surgical slicing of the gsp_slot which couples this flag
+        # to the GSP-N layout. The coarser permute-all-agents approach is cleaner
+        # and still cleanly answers "do prediction values matter?".
+        #
+        # RNG: seeded with config seed + 7 so it is deterministic given the run
+        # seed but distinct from the policy/env/buffer RNG streams. The generator
+        # is initialized in RL-CollectiveTransport's agent.make_agent_state.
+        # gsp-rl exposes only the flag; the permutation logic lives in host code.
+        # Default False preserves legacy behavior.
+        self.gsp_shuffle_predictions = bool(config.get('GSP_SHUFFLE_PREDICTIONS', False))
+
         # Candidate A — change what the GSP head predicts. Default 'delta_theta'
         # is the legacy collective-Δθ target used in all dissertation runs (and
         # the target that produced the head collapse documented in H-13/H-14).
