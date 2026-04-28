@@ -120,11 +120,18 @@ def test_cchain_default_lambda_is_noop():
 
     actor.gsp_networks['actor'].optimizer.step = counting_step
 
-    loss_val = actor.learn_gsp_mse(actor.gsp_networks)
+    result = actor.learn_gsp_mse(actor.gsp_networks)
 
-    assert loss_val is not None, "learn_gsp_mse must return a loss"
-    assert isinstance(loss_val, float), f"Expected float, got {type(loss_val)}"
+    # learn_gsp_mse now returns (loss_float, batch_corr_float) — a tuple.
+    assert result is not None, "learn_gsp_mse must return a result"
+    assert isinstance(result, tuple) and len(result) == 2, (
+        f"Expected (loss_float, batch_corr_float) tuple, got {type(result)}"
+    )
+    loss_val, batch_corr = result
+    assert isinstance(loss_val, float), f"First element must be float loss, got {type(loss_val)}"
     assert np.isfinite(loss_val), f"Loss must be finite, got {loss_val}"
+    # batch_corr is either a finite float or nan (undefined correlation).
+    assert isinstance(batch_corr, float), f"Second element must be float corr, got {type(batch_corr)}"
     # With lambda=0.0, exactly one optimizer step: the MSE step.
     assert len(step_calls) == 1, (
         f"With lambda=0.0 exactly 1 optimizer step should occur, got {len(step_calls)}"

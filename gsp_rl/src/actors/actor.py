@@ -164,6 +164,13 @@ class Actor(NetworkAids):
         self.last_gsp_loss: float | None = None
         # Populated by learn() when the e2e path fires; reset to None each learn() call.
         self.last_e2e_diagnostics = None
+        # Phase 4 loss-step correlation diagnostic. Accumulates one float per
+        # GSP learn step (the Pearson corr between fresh forward-pass preds and
+        # replay-buffer labels for that batch). Collected by Main.py at episode
+        # end to produce mean/std attrs in HDF5. Main.py is responsible for
+        # clearing this list after consuming it (not reset per-tick like
+        # last_gsp_loss, because it accumulates across an episode).
+        self.last_gsp_loss_step_corr_samples: list = []
 
     def build_networks(self, learning_scheme):
         if learning_scheme == 'None':
@@ -542,11 +549,20 @@ class Actor(NetworkAids):
         elif scheme in {'DDPG', 'TD3'}:
             loss = self.learn_gsp_mse(self.gsp_networks, recurrent=False)
         if loss is not None:
-            # Keep the tuple-skip guard for safety in case learn_attention's
-            # return type ever changes; learn_gsp_mse returns a plain float.
+            # learn_gsp_mse returns (loss_float, batch_corr_float).
+            # learn_attention returns a plain float — keep the tuple dispatch.
             if isinstance(loss, tuple):
-                return
-            self.last_gsp_loss = float(loss)
+                loss_val, batch_corr = loss
+                self.last_gsp_loss = float(loss_val)
+                # Accumulate per-batch loss-step correlations across all GSP learn
+                # steps within this episode. Main.py reads
+                # last_gsp_loss_step_corr_samples at episode end, computes
+                # mean/std, and passes them to hdf5_writer. Attribute is
+                # initialised in __init__ and cleared by Main.py at episode end.
+                if not math.isnan(batch_corr):
+                    self.last_gsp_loss_step_corr_samples.append(batch_corr)
+            else:
+                self.last_gsp_loss = float(loss)
 
     def store_agent_transition(self, s, a, r, s_, d, gsp_obs=None, gsp_label=None):
         self.store_transition(s, a, r, s_, d, self.networks, gsp_obs=gsp_obs, gsp_label=gsp_label)

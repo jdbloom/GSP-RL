@@ -981,7 +981,37 @@ class NetworkAids(Hyperparameters):
             networks['actor'].optimizer.step()
 
         networks['learn_step_counter'] += 1
-        return loss.item()
+
+        # Phase 4 — loss-step correlation diagnostic.
+        # Compute Pearson correlation between the FRESH forward-pass predictions
+        # (the same preds that produced the MSE loss) and the replay-buffer labels.
+        # This is intentionally different from gsp_pred_target_corr in hdf5_logger,
+        # which accumulates actor-input-path predictions over a full episode (a
+        # different code path with a 1-timestep lag). Computing per-batch here and
+        # aggregating in the caller lets us compare "is the loss-path head actually
+        # learning?" vs "is the actor-input path measurement broken?"
+        #
+        # Safety contract:
+        # - Uses T.no_grad() / detach — zero gradient graph impact.
+        # - NaN/zero-variance guard: returns float("nan") when undefined.
+        # - Shape agnostic: flattens both arrays before corrcoef.
+        # - Recurrent path: preds/labels_shaped not available in that scope,
+        #   so we skip and return nan for consistency.
+        batch_corr: float = float("nan")
+        if not recurrent:
+            with T.no_grad():
+                _pred_np = preds.detach().cpu().numpy().flatten()
+                _lbl_np = labels_shaped.detach().cpu().numpy().flatten()
+                if _pred_np.size > 1:
+                    _STD_TOL = 1e-12
+                    _p_std = float(np.nanstd(_pred_np))
+                    _l_std = float(np.nanstd(_lbl_np))
+                    if _p_std > _STD_TOL and _l_std > _STD_TOL:
+                        _mask = np.isfinite(_pred_np) & np.isfinite(_lbl_np)
+                        if _mask.sum() > 1:
+                            batch_corr = float(np.corrcoef(_pred_np[_mask], _lbl_np[_mask])[0, 1])
+
+        return loss.item(), batch_corr
 
     def decrement_epsilon(self):
         self.epsilon = max(self.epsilon-self.eps_dec, self.eps_min)
