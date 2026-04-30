@@ -499,9 +499,15 @@ class Actor(NetworkAids):
                 return
 
         if self.gsp:
-            if self.networks['learn_step_counter'] % self.gsp_learning_offset == 0:
-                #print('[DEBUG] Learning Attention', self.networks['learn_step_counter'])
-                self.learn_gsp()
+            # H-phase5-4: when GSP_HEAD_FROZEN is true, skip the GSP head's
+            # optimizer step entirely. Head stays at random init for the
+            # entire run. Tests whether reward-shaping wins require head
+            # learning at all, or whether reward density alone explains the
+            # effect. Default false preserves all prior behavior.
+            if not getattr(self, 'gsp_head_frozen', False):
+                if self.networks['learn_step_counter'] % self.gsp_learning_offset == 0:
+                    #print('[DEBUG] Learning Attention', self.networks['learn_step_counter'])
+                    self.learn_gsp()
 
         if self.networks['learning_scheme'] == 'DDQN' and getattr(self, 'gsp_e2e_enabled', False) and self.gsp:
             self.replace_target_network()

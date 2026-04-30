@@ -326,6 +326,10 @@ class Hyperparameters:
         self.update_actor_iter = config['UPDATE_ACTOR_ITER']
         self.warmup = config['WARMUP']
         self.time_step = 0
+        # H-phase5-4: when True, skip the GSP head's optimizer step entirely.
+        # Head stays at random init for the run. Default False preserves all
+        # prior behavior. Read in actor.py:502 in the learn() loop.
+        self.gsp_head_frozen = bool(config.get('GSP_HEAD_FROZEN', False))
 
 class NetworkAids(Hyperparameters):
     """Network factory, learning algorithms, action selection, and memory management.
