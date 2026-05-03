@@ -1001,6 +1001,15 @@ class Actor(NetworkAids):
         if self.attention_gsp:
             if self.gsp_networks['learning_scheme'] == 'attention':
                 self.gsp_networks['attention'].save_checkpoint(path)
+        elif self.gsp and getattr(self, 'gsp_jepa_enabled', False):
+            # JEPA path: save encoder_online + predictor + target_encoder via torch.save
+            import torch
+            jepa_state = {
+                'encoder_online': self.gsp_encoder_online.state_dict(),
+                'encoder_target': self.gsp_encoder_target.state_dict(),
+                'predictor': self.gsp_predictor.state_dict(),
+            }
+            torch.save(jepa_state, f"{path}_jepa.pt")
         elif self.gsp:
             self.gsp_networks['actor'].save_checkpoint(path, self.gsp)
             self.gsp_networks['target_actor'].save_checkpoint(path, self.gsp)
@@ -1036,6 +1045,14 @@ class Actor(NetworkAids):
         if self.attention_gsp:
             if self.gsp_networks['learning_scheme'] == 'attention':
                 self.gsp_networks['attention'].load_checkpoint(path)
+        elif self.gsp and getattr(self, 'gsp_jepa_enabled', False):
+            import os, torch
+            jepa_path = f"{path}_jepa.pt"
+            if os.path.exists(jepa_path):
+                state = torch.load(jepa_path, map_location='cpu')
+                self.gsp_encoder_online.load_state_dict(state['encoder_online'])
+                self.gsp_encoder_target.load_state_dict(state['encoder_target'])
+                self.gsp_predictor.load_state_dict(state['predictor'])
         elif self.gsp:
             self.gsp_networks['actor'].load_checkpoint(path, self.gsp)
             self.gsp_networks['target_actor'].load_checkpoint(path, self.gsp)
