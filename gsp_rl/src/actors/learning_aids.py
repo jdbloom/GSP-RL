@@ -177,6 +177,15 @@ class Hyperparameters:
         self.beta = config['BETA']
         self.lr = config['LR']
 
+        # Phase 4 — independent GSP head learning rate.
+        # Default: same value as the trunk/actor LR (config['LR']), preserving
+        # exact legacy behavior for all existing batches. When set to a different
+        # value, the GSP prediction head's Adam optimizer uses gsp_head_lr while
+        # the main action-network optimizer continues to use self.lr.
+        # Only affects the GSP actor/head network; the GSP critic and target
+        # networks are unchanged (they remain tied to self.lr).
+        self.gsp_head_lr = float(config.get('GSP_HEAD_LR', self.lr))
+
         self.epsilon = config['EPSILON']
         self.eps_min = config['EPS_MIN']
         self.eps_dec = config['EPS_DEC']
@@ -317,6 +326,19 @@ class Hyperparameters:
         self.update_actor_iter = config['UPDATE_ACTOR_ITER']
         self.warmup = config['WARMUP']
         self.time_step = 0
+        # H-phase5-4: when True, skip the GSP head's optimizer step entirely.
+        # Head stays at random init for the run. Default False preserves all
+        # prior behavior. Read in actor.py:502 in the learn() loop.
+        self.gsp_head_frozen = bool(config.get('GSP_HEAD_FROZEN', False))
+
+        # JEPA (Joint Embedding Predictive Architecture) latent-space head.
+        # When enabled, the legacy scalar future_prox prediction is replaced
+        # by: online encoder → predictor → latent MSE against EMA target encoder.
+        # The actor receives the 32-d encoder output instead of the 1-d gsp_pred.
+        # Default False — all existing runs are unaffected.
+        self.gsp_jepa_enabled = bool(config.get('GSP_JEPA_ENABLED', False))
+        self.gsp_encoder_dim = int(config.get('GSP_ENCODER_DIM', 32))
+        self.gsp_encoder_ema_tau = float(config.get('GSP_ENCODER_EMA_TAU', 0.995))
 
 class NetworkAids(Hyperparameters):
     """Network factory, learning algorithms, action selection, and memory management.
@@ -972,7 +994,139 @@ class NetworkAids(Hyperparameters):
             networks['actor'].optimizer.step()
 
         networks['learn_step_counter'] += 1
-        return loss.item()
+
+        # Phase 4 — loss-step correlation diagnostic.
+        # Compute Pearson correlation between the FRESH forward-pass predictions
+        # (the same preds that produced the MSE loss) and the replay-buffer labels.
+        # This is intentionally different from gsp_pred_target_corr in hdf5_logger,
+        # which accumulates actor-input-path predictions over a full episode (a
+        # different code path with a 1-timestep lag). Computing per-batch here and
+        # aggregating in the caller lets us compare "is the loss-path head actually
+        # learning?" vs "is the actor-input path measurement broken?"
+        #
+        # Safety contract:
+        # - Uses T.no_grad() / detach — zero gradient graph impact.
+        # - NaN/zero-variance guard: returns float("nan") when undefined.
+        # - Shape agnostic: flattens both arrays before corrcoef.
+        # - Recurrent path: preds/labels_shaped not available in that scope,
+        #   so we skip and return nan for consistency.
+        batch_corr: float = float("nan")
+        if not recurrent:
+            with T.no_grad():
+                _pred_np = preds.detach().cpu().numpy().flatten()
+                _lbl_np = labels_shaped.detach().cpu().numpy().flatten()
+                if _pred_np.size > 1:
+                    _STD_TOL = 1e-12
+                    _p_std = float(np.nanstd(_pred_np))
+                    _l_std = float(np.nanstd(_lbl_np))
+                    if _p_std > _STD_TOL and _l_std > _STD_TOL:
+                        _mask = np.isfinite(_pred_np) & np.isfinite(_lbl_np)
+                        if _mask.sum() > 1:
+                            batch_corr = float(np.corrcoef(_pred_np[_mask], _lbl_np[_mask])[0, 1])
+
+        return loss.item(), batch_corr
+
+    def _update_jepa_target_encoder(self, tau: float) -> None:
+        """EMA update: target_p ← tau * target_p + (1 - tau) * online_p.
+
+        Args:
+            tau: EMA decay coefficient (e.g. 0.995). Higher = slower update.
+        """
+        with T.no_grad():
+            for online_p, target_p in zip(
+                self.gsp_encoder_online.parameters(),
+                self.gsp_encoder_target.parameters(),
+            ):
+                target_p.data.mul_(tau).add_(online_p.data, alpha=1.0 - tau)
+
+    def learn_gsp_jepa(self, networks: dict):
+        """Train the JEPA latent-space GSP head.
+
+        Samples (state_t, state_{t+k}) pairs from the JEPA replay buffer
+        (state_t in the 'state' slot, state_{t+k} in the 'action' slot by
+        convention). Computes:
+
+            z_t     = encoder_online(state_t)           # online encoding
+            z_pred  = predictor(z_t)                    # predicted future latent
+            z_target = encoder_target(state_{t+k}).detach()   # EMA target
+
+            loss_pred = MSE(z_pred, z_target)           # latent prediction loss
+
+        Optional VICReg variance + covariance penalties on z_t are added
+        when self.gsp_vicreg_enabled is True (reusing existing helpers).
+
+        After backward + optimizer step, the target encoder is updated via EMA.
+
+        Returns:
+            Tuple (loss_float, latent_stats_dict) where latent_stats_dict has:
+                {var: float, rank: float, pred_mse: float}
+        """
+        if networks['replay'].mem_ctr < self.gsp_batch_size:
+            return None
+
+        vicreg_enabled = getattr(self, 'gsp_vicreg_enabled', False)
+        tau = float(getattr(self, 'gsp_encoder_ema_tau', 0.995))
+        enc_device = self.gsp_encoder_online.device
+
+        # Sample directly from the JEPA replay buffer rather than going through
+        # sample_memory(), which requires a 'actor' or 'q_eval' key in networks
+        # to determine device. JEPA networks dict has neither — device comes from
+        # the encoder module itself.
+        result = networks['replay'].sample_buffer(self.gsp_batch_size)
+        raw_states, raw_future, _, _, _ = result[0], result[1], result[2], result[3], result[4]
+        states = T.tensor(raw_states, dtype=T.float32).to(enc_device)
+        # future_states: stored in the 'action' slot by convention (state_{t+k})
+        future_states = T.tensor(raw_future, dtype=T.float32).to(enc_device)
+
+        # Forward through online encoder + predictor
+        z_t = self.gsp_encoder_online(states)
+        z_pred = self.gsp_predictor(z_t)
+
+        # Target: forward through frozen target encoder
+        with T.no_grad():
+            z_target = self.gsp_encoder_target(future_states)
+
+        loss_pred = F.mse_loss(z_pred, z_target)
+        loss = loss_pred
+
+        # Optional VICReg on online encoder output z_t
+        if vicreg_enabled:
+            var_coef = float(getattr(self, 'gsp_vicreg_var_coef', 1.0))
+            cov_coef = float(getattr(self, 'gsp_vicreg_cov_coef', 0.04))
+            # target_std: 1.0 (standard VICReg default) — latent lives in
+            # unbounded linear space so label-std normalization is not needed.
+            var_loss = vicreg_variance_loss(z_t, target_std=1.0)
+            cov_loss = vicreg_covariance_loss(z_t)
+            loss = loss_pred + var_coef * var_loss + cov_coef * cov_loss
+
+        self._jepa_online_optimizer.zero_grad()
+        loss.backward()
+        _check_nan(loss, f"JEPA loss at step {networks['learn_step_counter']}")
+        self._jepa_online_optimizer.step()
+
+        # EMA update of target encoder
+        self._update_jepa_target_encoder(tau)
+
+        networks['learn_step_counter'] += 1
+
+        # Compute latent statistics (no grad)
+        with T.no_grad():
+            latent_var = float(z_t.var(dim=0).mean().item())
+            # Approximate rank: number of singular values above 1% of max
+            z_cpu = z_t.detach().cpu()
+            try:
+                sv = T.linalg.svdvals(z_cpu)
+                rank = float((sv > sv[0] * 0.01).sum().item())
+            except Exception:
+                rank = float("nan")
+            pred_mse = float(loss_pred.item())
+
+        latent_stats = {
+            'var': latent_var,
+            'rank': rank,
+            'pred_mse': pred_mse,
+        }
+        return loss.item(), latent_stats
 
     def decrement_epsilon(self):
         self.epsilon = max(self.epsilon-self.eps_dec, self.eps_min)

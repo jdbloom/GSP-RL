@@ -23,6 +23,7 @@ from gsp_rl.src.buffers import(
     AttentionSequenceReplayBuffer
 )
 from gsp_rl.src.actors.learning_aids import NetworkAids
+from gsp_rl.src.networks.jepa import JEPAEncoder, JEPAPredictor
 
 
 class Actor(NetworkAids):
@@ -132,10 +133,15 @@ class Actor(NetworkAids):
 
         self.network_input_size = self.input_size
         if self.gsp:
-            # For multi-dim GSP output (gsp_output_kind != delta_theta_1d),
-            # the actor's augmented obs grows by the full output vector width,
-            # not just 1. agent.py's make_agent_state handles the concatenation.
-            self.network_input_size += self.gsp_network_output
+            if getattr(self, 'gsp_jepa_enabled', False):
+                # JEPA path: actor receives the full latent vector (encoder_dim)
+                # instead of the legacy scalar/K-dim GSP prediction.
+                self.network_input_size += getattr(self, 'gsp_encoder_dim', 32)
+            else:
+                # For multi-dim GSP output (gsp_output_kind != delta_theta_1d),
+                # the actor's augmented obs grows by the full output vector width,
+                # not just 1. agent.py's make_agent_state handles the concatenation.
+                self.network_input_size += self.gsp_network_output
         if self.attention_gsp:  
             self.attention_observation = [[0 for _ in range(self.gsp_network_input)] for _ in range(self.gsp_sequence_length)]
         elif self.recurrent_gsp:
@@ -143,10 +149,51 @@ class Actor(NetworkAids):
 
         self.build_networks(network)
         self.gsp_networks = None
+
+        # JEPA latent-space encoder path. When enabled, skip the legacy
+        # DDPG-based GSP build and instantiate encoder + predictor instead.
+        # The target encoder is an EMA copy of the online encoder (frozen).
+        self.gsp_encoder_online = None
+        self.gsp_encoder_target = None
+        self.gsp_predictor = None
+        self._jepa_online_optimizer = None
+        self._jepa_predictor_optimizer = None
+
         if gsp:
-            if attention:
-                self.build_gsp_network('attention')
-            self.build_gsp_network('DDPG')
+            if getattr(self, 'gsp_jepa_enabled', False):
+                import copy
+                _enc_dim = getattr(self, 'gsp_encoder_dim', 32)
+                _head_lr = getattr(self, 'gsp_head_lr', self.lr)
+                self.gsp_encoder_online = JEPAEncoder(
+                    input_dim=self.gsp_network_input,
+                    latent_dim=_enc_dim,
+                )
+                # Target encoder: EMA copy — weights frozen, no gradient
+                self.gsp_encoder_target = copy.deepcopy(self.gsp_encoder_online)
+                for param in self.gsp_encoder_target.parameters():
+                    param.requires_grad = False
+                self.gsp_predictor = JEPAPredictor(latent_dim=_enc_dim)
+                # Optimizers: online encoder + predictor share one optimizer
+                self._jepa_online_optimizer = T.optim.Adam(
+                    list(self.gsp_encoder_online.parameters())
+                    + list(self.gsp_predictor.parameters()),
+                    lr=_head_lr,
+                )
+                # JEPA requires a replay buffer for (state_t, state_{t+k}) pairs.
+                # We reuse the standard ReplayBuffer; the future state is stored
+                # in the 'action' slot by convention (matches future_prox label path).
+                self.gsp_networks = {}
+                self.gsp_networks['learning_scheme'] = 'JEPA'
+                self.gsp_networks['replay'] = ReplayBuffer(
+                    self.mem_size, self.gsp_network_input,
+                    self.gsp_network_input, 'Continuous'
+                )
+                self.gsp_networks['learn_step_counter'] = 0
+                self.gsp_networks['output_size'] = _enc_dim
+            else:
+                if attention:
+                    self.build_gsp_network('attention')
+                self.build_gsp_network('DDPG')
 
         # Information-collapse diagnostic: last GSP learner training loss.
         # NOTE: this is the loss returned by the GSP learner's inner learn step, which means:
@@ -164,6 +211,17 @@ class Actor(NetworkAids):
         self.last_gsp_loss: float | None = None
         # Populated by learn() when the e2e path fires; reset to None each learn() call.
         self.last_e2e_diagnostics = None
+        # Phase 4 loss-step correlation diagnostic. Accumulates one float per
+        # GSP learn step (the Pearson corr between fresh forward-pass preds and
+        # replay-buffer labels for that batch). Collected by Main.py at episode
+        # end to produce mean/std attrs in HDF5. Main.py is responsible for
+        # clearing this list after consuming it (not reset per-tick like
+        # last_gsp_loss, because it accumulates across an episode).
+        self.last_gsp_loss_step_corr_samples: list = []
+        # JEPA latent stats from the most recent learn_gsp_jepa call. Dict with
+        # keys {var, rank, pred_mse}. Reset to None each learn() tick (like
+        # last_gsp_loss). Main.py reads this to call hdf5_writer.record_jepa_*.
+        self.last_gsp_jepa_stats: dict | None = None
 
     def build_networks(self, learning_scheme):
         if learning_scheme == 'None':
@@ -337,7 +395,13 @@ class Actor(NetworkAids):
             'id':self.id,
             'input_size':self.gsp_network_input,
             'output_size':self.gsp_network_output,
-            'lr': self.lr,
+            # Phase 4: use gsp_head_lr (independent of trunk/actor LR).
+            # Default: same as self.lr (from config['LR']), so existing batches are
+            # bit-for-bit identical. Override via GSP_HEAD_LR in the experiment YAML.
+            # The GSP critic LR intentionally stays at self.lr — only the actor/head
+            # that produces predictions (and is trained via supervised MSE) gets the
+            # independent rate.
+            'lr': getattr(self, 'gsp_head_lr', self.lr),
             'min_max_action':self.min_max_action,
             # Task 0 ablation knobs — defaults preserve legacy behavior exactly.
             # Only the GSP-head actor network receives these; the main policy actor
@@ -480,15 +544,22 @@ class Actor(NetworkAids):
         # Reset per-tick diagnostic signals. None means "no step ran this tick".
         self.last_gsp_loss = None
         self.last_e2e_diagnostics = None
+        self.last_gsp_jepa_stats = None
 
         # TODO Not sure why we have n_agents*batch_size + batch_size
         if self.networks['replay'].mem_ctr < self.batch_size: # (self.n_agents*self.batch_size + self.batch_size):
                 return
 
         if self.gsp:
-            if self.networks['learn_step_counter'] % self.gsp_learning_offset == 0:
-                #print('[DEBUG] Learning Attention', self.networks['learn_step_counter'])
-                self.learn_gsp()
+            # H-phase5-4: when GSP_HEAD_FROZEN is true, skip the GSP head's
+            # optimizer step entirely. Head stays at random init for the
+            # entire run. Tests whether reward-shaping wins require head
+            # learning at all, or whether reward density alone explains the
+            # effect. Default false preserves all prior behavior.
+            if not getattr(self, 'gsp_head_frozen', False):
+                if self.networks['learn_step_counter'] % self.gsp_learning_offset == 0:
+                    #print('[DEBUG] Learning Attention', self.networks['learn_step_counter'])
+                    self.learn_gsp()
 
         if self.networks['learning_scheme'] == 'DDQN' and getattr(self, 'gsp_e2e_enabled', False) and self.gsp:
             self.replace_target_network()
@@ -529,18 +600,36 @@ class Actor(NetworkAids):
         # for root cause analysis.
         loss = None
         scheme = self.gsp_networks['learning_scheme']
-        if scheme == 'attention':
+        if scheme == 'JEPA':
+            loss = self.learn_gsp_jepa(self.gsp_networks)
+        elif scheme == 'attention':
             loss = self.learn_attention(self.gsp_networks)
         elif scheme == 'RDDPG':
             loss = self.learn_gsp_mse(self.gsp_networks, recurrent=True)
         elif scheme in {'DDPG', 'TD3'}:
             loss = self.learn_gsp_mse(self.gsp_networks, recurrent=False)
         if loss is not None:
-            # Keep the tuple-skip guard for safety in case learn_attention's
-            # return type ever changes; learn_gsp_mse returns a plain float.
+            # learn_gsp_mse returns (loss_float, batch_corr_float).
+            # learn_gsp_jepa returns (loss_float, latent_stats_dict).
+            # learn_attention returns a plain float — keep the tuple dispatch.
             if isinstance(loss, tuple):
-                return
-            self.last_gsp_loss = float(loss)
+                loss_val = loss[0]
+                self.last_gsp_loss = float(loss_val)
+                extra = loss[1]
+                if isinstance(extra, dict):
+                    # JEPA path: store latent stats for Main.py to record.
+                    self.last_gsp_jepa_stats = extra
+                elif isinstance(extra, float):
+                    batch_corr = extra
+                    # Accumulate per-batch loss-step correlations across all GSP learn
+                    # steps within this episode. Main.py reads
+                    # last_gsp_loss_step_corr_samples at episode end, computes
+                    # mean/std, and passes them to hdf5_writer. Attribute is
+                    # initialised in __init__ and cleared by Main.py at episode end.
+                    if not math.isnan(batch_corr):
+                        self.last_gsp_loss_step_corr_samples.append(batch_corr)
+            else:
+                self.last_gsp_loss = float(loss)
 
     def store_agent_transition(self, s, a, r, s_, d, gsp_obs=None, gsp_label=None):
         self.store_transition(s, a, r, s_, d, self.networks, gsp_obs=gsp_obs, gsp_label=gsp_label)
@@ -912,6 +1001,15 @@ class Actor(NetworkAids):
         if self.attention_gsp:
             if self.gsp_networks['learning_scheme'] == 'attention':
                 self.gsp_networks['attention'].save_checkpoint(path)
+        elif self.gsp and getattr(self, 'gsp_jepa_enabled', False):
+            # JEPA path: save encoder_online + predictor + target_encoder via torch.save
+            import torch
+            jepa_state = {
+                'encoder_online': self.gsp_encoder_online.state_dict(),
+                'encoder_target': self.gsp_encoder_target.state_dict(),
+                'predictor': self.gsp_predictor.state_dict(),
+            }
+            torch.save(jepa_state, f"{path}_jepa.pt")
         elif self.gsp:
             self.gsp_networks['actor'].save_checkpoint(path, self.gsp)
             self.gsp_networks['target_actor'].save_checkpoint(path, self.gsp)
@@ -947,6 +1045,14 @@ class Actor(NetworkAids):
         if self.attention_gsp:
             if self.gsp_networks['learning_scheme'] == 'attention':
                 self.gsp_networks['attention'].load_checkpoint(path)
+        elif self.gsp and getattr(self, 'gsp_jepa_enabled', False):
+            import os, torch
+            jepa_path = f"{path}_jepa.pt"
+            if os.path.exists(jepa_path):
+                state = torch.load(jepa_path, map_location='cpu')
+                self.gsp_encoder_online.load_state_dict(state['encoder_online'])
+                self.gsp_encoder_target.load_state_dict(state['encoder_target'])
+                self.gsp_predictor.load_state_dict(state['predictor'])
         elif self.gsp:
             self.gsp_networks['actor'].load_checkpoint(path, self.gsp)
             self.gsp_networks['target_actor'].load_checkpoint(path, self.gsp)
