@@ -897,6 +897,14 @@ class NetworkAids(Hyperparameters):
         if networks['replay'].mem_ctr < self.gsp_batch_size:
             return None
 
+        # Defensive: diagnostics put the actor in eval() and don't always
+        # restore train(). cuDNN's RNN backward fails if the LSTM is in eval
+        # mode at backward time ("cudnn RNN backward can only be called in
+        # training mode") — Mac MPS doesn't have this restriction so the bug
+        # is GPU-only. Restoring train() here is a no-op for non-recurrent
+        # heads and prevents the crash for RDDPG (R-GSP-N).
+        networks['actor'].train()
+
         vicreg_enabled = getattr(self, 'gsp_vicreg_enabled', False)
 
         if recurrent:
