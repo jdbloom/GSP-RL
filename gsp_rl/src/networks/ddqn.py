@@ -46,6 +46,7 @@ class DDQN(nn.Module):
             fc2_dims: int = 128,
             name: str = 'DDQN',
             use_layer_norm: bool = False,
+            critic_loss: str = 'mse',
     ) -> None:
         """Initialize DDQN network.
 
@@ -63,6 +64,11 @@ class DDQN(nn.Module):
                 trunk placement follows BRO (NeurIPS 2024) and Lyle et al. (NeurIPS
                 2024) which show LN in the trunk is the most effective off-policy RL
                 plasticity stabilizer.
+            critic_loss: 'mse' (default, legacy) or 'huber'. Huber (SmoothL1,
+                beta=1.0) caps the per-sample gradient magnitude for |TD error|>1,
+                the most effective divergence control under Adam where a global
+                gradient rescale is normalized away. Controlled by the CRITIC_LOSS
+                config flag.
         """
         super().__init__()
 
@@ -79,7 +85,7 @@ class DDQN(nn.Module):
 
         self.optimizer = optim.Adam(self.parameters(), lr = lr, weight_decay = 1e-4)
 
-        self.loss = nn.MSELoss()
+        self.loss = nn.SmoothL1Loss() if str(critic_loss).lower() == 'huber' else nn.MSELoss()
 
         self.device = get_device()
 

@@ -246,6 +246,7 @@ class Actor(NetworkAids):
                 'output_size':self.output_size,
                 'input_size':self.network_input_size,
                 'use_layer_norm': getattr(self, 'actor_use_layer_norm', False),
+                'critic_loss': getattr(self, 'critic_loss', 'mse'),
             }
             self.networks = self.build_DDQN(nn_args)
             self.networks['learning_scheme'] = 'DDQN'

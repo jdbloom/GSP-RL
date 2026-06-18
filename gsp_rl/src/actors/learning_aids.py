@@ -197,6 +197,25 @@ class Hyperparameters:
         self.mem_size = config['MEM_SIZE']
         self.replace_target_ctr = config['REPLACE_TARGET_COUNTER']
 
+        # --- Critic-divergence stabilizers (all default to legacy no-ops) -----
+        # The gate task induces off-policy Q-value divergence: with MSE loss on
+        # large-magnitude returns (per-robot returns in the thousands, gamma
+        # ~0.99997), the DDQN critic loss escalates ~3 orders of magnitude over
+        # training and the policy collapses after an early success peak. These
+        # flags expose the standard divergence controls. Defaults reproduce the
+        # exact prior behavior, so existing batches are unaffected.
+        #   CRITIC_LOSS    : 'mse' (default) | 'huber' — Huber/SmoothL1 caps the
+        #                    per-sample gradient, the strongest lever under Adam.
+        #   GRAD_CLIP_NORM : >0 clips the Q-network grad-norm after backward.
+        #   REWARD_SCALE   : multiplies the immediate reward in the TD target
+        #                    (preserves the horizon, unlike lowering gamma).
+        #   Q_TARGET_CLIP  : >0 clamps the bootstrap target to [-v, v], bounding
+        #                    the overestimation runaway.
+        self.critic_loss = str(config.get('CRITIC_LOSS', 'mse')).lower()
+        self.grad_clip_norm = float(config.get('GRAD_CLIP_NORM', 0.0))
+        self.reward_scale = float(config.get('REWARD_SCALE', 1.0))
+        self.q_target_clip = float(config.get('Q_TARGET_CLIP', 0.0))
+
         self.gsp_e2e_enabled = bool(config.get('GSP_E2E_ENABLED', False))
         self.gsp_e2e_lambda = float(config.get('GSP_E2E_LAMBDA', 1.0))
         self.gsp_e2e_linear_output = bool(config.get('GSP_E2E_LINEAR_OUTPUT', False))
@@ -539,13 +558,17 @@ class NetworkAids(Hyperparameters):
 
         q_next[dones] = 0.0
 
-        q_target = rewards + self.gamma*q_next[indices, max_actions]
+        q_target = self.reward_scale*rewards + self.gamma*q_next[indices, max_actions]
+        if self.q_target_clip > 0:
+            q_target = T.clamp(q_target, -self.q_target_clip, self.q_target_clip)
 
         loss = networks['q_eval'].loss(q_target, q_pred).to(networks['q_eval'].device)
 
         loss.backward()
         _check_nan(loss, f"DDQN loss at step {networks['learn_step_counter']}")
-        
+        if self.grad_clip_norm > 0:
+            T.nn.utils.clip_grad_norm_(networks['q_eval'].parameters(), self.grad_clip_norm)
+
         networks['q_eval'].optimizer.step()
 
         networks['learn_step_counter']+=1
