@@ -5,6 +5,7 @@ REWARD_SCALE, Q_TARGET_CLIP. Defaults must reproduce exact legacy behavior
 import os
 import copy
 import yaml
+import torch as T
 import torch.nn as nn
 
 from gsp_rl.src.networks import DDQN
@@ -62,3 +63,42 @@ def test_make_ddqn_networks_threads_huber():
          'critic_loss': 'huber'})
     assert isinstance(nets['q_eval'].loss, nn.SmoothL1Loss)
     assert isinstance(nets['q_next'].loss, nn.SmoothL1Loss)
+
+
+# --- shared critic helpers (used by ALL of DQN/DDQN/DDPG/RDDPG/TD3) ---------
+
+def test_shared_critic_loss_fn_switches_with_flag():
+    assert isinstance(NetworkAids(copy.deepcopy(BASE_CONFIG))._critic_loss_fn, nn.MSELoss)
+    cfg = copy.deepcopy(BASE_CONFIG); cfg['CRITIC_LOSS'] = 'huber'
+    assert isinstance(NetworkAids(cfg)._critic_loss_fn, nn.SmoothL1Loss)
+
+
+def test_q_target_default_is_plain_bellman():
+    na = NetworkAids(copy.deepcopy(BASE_CONFIG))  # reward_scale=1, clip=0
+    r, boot = T.tensor([1.0, -2.0]), T.tensor([10.0, 20.0])
+    assert T.allclose(na._q_target(r, boot), r + na.gamma * boot)
+
+
+def test_q_target_applies_reward_scale_then_clip():
+    cfg = copy.deepcopy(BASE_CONFIG); cfg.update({'REWARD_SCALE': 0.5, 'Q_TARGET_CLIP': 5.0})
+    na = NetworkAids(cfg)
+    # 0.5*100 + gamma*0 = 50, clamped to 5
+    assert T.allclose(na._q_target(T.tensor([100.0]), T.tensor([0.0])), T.tensor([5.0]))
+
+
+def test_clip_critic_grad_noop_when_disabled():
+    na = NetworkAids(copy.deepcopy(BASE_CONFIG))  # grad_clip_norm=0
+    net = DDQN(id=1, lr=1e-4, input_size=4, output_size=2)
+    net((T.ones(1, 4) * 50).to(net.device)).sum().backward()
+    g = net.fc1.weight.grad.norm().item()
+    na._clip_critic_grad(net)
+    assert net.fc1.weight.grad.norm().item() == g
+
+
+def test_clip_critic_grad_clips_when_enabled():
+    cfg = copy.deepcopy(BASE_CONFIG); cfg['GRAD_CLIP_NORM'] = 0.001
+    na = NetworkAids(cfg)
+    net = DDQN(id=1, lr=1e-4, input_size=4, output_size=2)
+    net((T.ones(1, 4) * 50).to(net.device)).sum().backward()
+    na._clip_critic_grad(net)
+    assert net.fc1.weight.grad.norm().item() <= 0.001 + 1e-6

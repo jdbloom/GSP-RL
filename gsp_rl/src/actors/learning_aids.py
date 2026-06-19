@@ -215,6 +215,14 @@ class Hyperparameters:
         self.grad_clip_norm = float(config.get('GRAD_CLIP_NORM', 0.0))
         self.reward_scale = float(config.get('REWARD_SCALE', 1.0))
         self.q_target_clip = float(config.get('Q_TARGET_CLIP', 0.0))
+        # Single configurable critic-loss fn used by every value-bootstrapping
+        # update (DQN/DDQN/DDPG/RDDPG/TD3). 'mse' reproduces the legacy global
+        # MSELoss / F.mse_loss exactly. Applied via the helpers below so all five
+        # algorithms get identical divergence control. (GSP prediction losses and
+        # the actor policy-gradient loss are intentionally NOT touched — they are
+        # not value-bootstrapping and do not exhibit the same divergence.)
+        self._critic_loss_fn = (
+            nn.SmoothL1Loss() if self.critic_loss == 'huber' else nn.MSELoss())
 
         self.gsp_e2e_enabled = bool(config.get('GSP_E2E_ENABLED', False))
         self.gsp_e2e_lambda = float(config.get('GSP_E2E_LAMBDA', 1.0))
@@ -370,6 +378,27 @@ class NetworkAids(Hyperparameters):
     """
     def __init__(self, config):
         super().__init__(config)
+
+    # --- shared critic-divergence stabilizer helpers ----------------------
+    # Applied uniformly across every value-bootstrapping update. With default
+    # flags (reward_scale=1, q_target_clip=0, grad_clip_norm=0, critic_loss=mse)
+    # each helper is a no-op / identity, so all five algorithms reproduce their
+    # exact prior behavior.
+    def _q_target(self, rewards, bootstrap):
+        """Reward-scaled, optionally target-clipped Bellman target.
+        `rewards` and `bootstrap` must already be broadcast-compatible (callers
+        match the original per-algorithm shaping)."""
+        target = self.reward_scale * rewards + self.gamma * bootstrap
+        if self.q_target_clip > 0:
+            target = T.clamp(target, -self.q_target_clip, self.q_target_clip)
+        return target
+
+    def _clip_critic_grad(self, *nets):
+        """Clip critic grad-norm in place after backward() when enabled."""
+        if self.grad_clip_norm > 0:
+            for net in nets:
+                T.nn.utils.clip_grad_norm_(net.parameters(), self.grad_clip_norm)
+
     def make_DQN_networks(self, nn_args):
         return {'q_eval':DQN(**nn_args), 'q_next':DQN(**nn_args)}
     
@@ -528,11 +557,12 @@ class NetworkAids(Hyperparameters):
 
         q_next[dones] = 0.0
 
-        q_target = rewards + self.gamma*q_next
+        q_target = self._q_target(rewards, q_next)
 
-        loss = networks['q_eval'].loss(q_target, q_pred).to(networks['q_eval'].device)
+        loss = self._critic_loss_fn(q_target, q_pred).to(networks['q_eval'].device)
         loss.backward()
         _check_nan(loss, f"DQN loss at step {networks['learn_step_counter']}")
+        self._clip_critic_grad(networks['q_eval'])
 
         networks['q_eval'].optimizer.step()
         networks['learn_step_counter'] += 1
@@ -558,16 +588,13 @@ class NetworkAids(Hyperparameters):
 
         q_next[dones] = 0.0
 
-        q_target = self.reward_scale*rewards + self.gamma*q_next[indices, max_actions]
-        if self.q_target_clip > 0:
-            q_target = T.clamp(q_target, -self.q_target_clip, self.q_target_clip)
+        q_target = self._q_target(rewards, q_next[indices, max_actions])
 
-        loss = networks['q_eval'].loss(q_target, q_pred).to(networks['q_eval'].device)
+        loss = self._critic_loss_fn(q_target, q_pred).to(networks['q_eval'].device)
 
         loss.backward()
         _check_nan(loss, f"DDQN loss at step {networks['learn_step_counter']}")
-        if self.grad_clip_norm > 0:
-            T.nn.utils.clip_grad_norm_(networks['q_eval'].parameters(), self.grad_clip_norm)
+        self._clip_critic_grad(networks['q_eval'])
 
         networks['q_eval'].optimizer.step()
 
@@ -712,15 +739,16 @@ class NetworkAids(Hyperparameters):
         target_actions = networks['target_actor'](states_)
         q_value_ = networks['target_critic'](states_, target_actions)
 
-        target = T.unsqueeze(rewards, 1) + self.gamma*q_value_
+        target = self._q_target(T.unsqueeze(rewards, 1), q_value_)
 
         #Critic Update
         networks['critic'].optimizer.zero_grad()
 
         q_value = networks['critic'](states, actions)
-        value_loss = Loss(q_value, target)
+        value_loss = self._critic_loss_fn(q_value, target)
         value_loss.backward()
         _check_nan(value_loss, f"DDPG critic loss at step {networks['learn_step_counter']}")
+        self._clip_critic_grad(networks['critic'])
         networks['critic'].optimizer.step()
 
         #Actor Update
@@ -794,15 +822,16 @@ class NetworkAids(Hyperparameters):
             # Use last timestep for Bellman target
             q_last_ = q_value_[:, -1, :]  # (batch, 1)
             r_last = train_rewards[:, -1]  # (batch,)
-            target = r_last.unsqueeze(1) + self.gamma * q_last_  # (batch, 1)
+            target = self._q_target(r_last.unsqueeze(1), q_last_)  # (batch, 1)
 
         # Critic update
         networks['critic'].optimizer.zero_grad()
         q_value, _ = networks['critic'](train_states, train_actions, hidden=critic_hidden)
         q_last = q_value[:, -1, :]  # (batch, 1)
-        value_loss = Loss(q_last, target)
+        value_loss = self._critic_loss_fn(q_last, target)
         value_loss.backward()
         _check_nan(value_loss, f"RDDPG critic loss at step {networks['learn_step_counter']}")
+        self._clip_critic_grad(networks['critic'])
         networks['critic'].optimizer.step()
 
         # Actor update
@@ -840,7 +869,7 @@ class NetworkAids(Hyperparameters):
             q2_ = q2_.view(-1)
 
             critic_value_ = T.min(q1_, q2_)
-            target = rewards + self.gamma * critic_value_
+            target = self._q_target(rewards, critic_value_)
 
         q1 = networks['critic_1'].forward(states, actions).squeeze()
         q2 = networks['critic_2'].forward(states, actions).squeeze()
@@ -848,12 +877,13 @@ class NetworkAids(Hyperparameters):
         networks['critic_1'].optimizer.zero_grad()
         networks['critic_2'].optimizer.zero_grad()
 
-        q1_loss = F.mse_loss(target, q1)
-        q2_loss = F.mse_loss(target, q2)
+        q1_loss = self._critic_loss_fn(target, q1)
+        q2_loss = self._critic_loss_fn(target, q2)
         critic_loss = q1_loss + q2_loss
 
         critic_loss.backward()
         _check_nan(critic_loss, f"TD3 critic loss at step {networks['learn_step_counter']}")
+        self._clip_critic_grad(networks['critic_1'], networks['critic_2'])
         networks['critic_1'].optimizer.step()
         networks['critic_2'].optimizer.step()
 
