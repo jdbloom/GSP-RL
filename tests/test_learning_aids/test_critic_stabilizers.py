@@ -102,3 +102,21 @@ def test_clip_critic_grad_clips_when_enabled():
     net((T.ones(1, 4) * 50).to(net.device)).sum().backward()
     na._clip_critic_grad(net)
     assert net.fc1.weight.grad.norm().item() <= 0.001 + 1e-6
+
+
+# --- numeric hyperparameter coercion (YAML sci-notation -> str crash class) ---
+
+def test_string_lr_coerced_in_hyperparameters():
+    cfg = copy.deepcopy(BASE_CONFIG)
+    cfg.update({'LR': '3e-05', 'ALPHA': '1e-3', 'BETA': '2e-3',
+                'GAMMA': '0.99', 'TAU': '5e-3'})
+    na = NetworkAids(cfg)
+    for v in (na.lr, na.alpha, na.beta, na.gamma, na.tau):
+        assert isinstance(v, float)
+    assert na.lr == 3e-05
+
+
+def test_ddqn_constructs_with_string_lr():
+    # '3e-05' as a str previously crashed Adam('<=' float vs str)
+    net = DDQN(id=1, lr='3e-05', input_size=4, output_size=2)
+    assert net.optimizer.param_groups[0]['lr'] == 3e-05
