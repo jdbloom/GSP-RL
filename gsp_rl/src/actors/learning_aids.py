@@ -171,11 +171,17 @@ class Hyperparameters:
     Also initializes self.time_step = 0 (used by TD3 warmup).
     """
     def __init__(self, config):
-        self.gamma = config['GAMMA']
-        self.tau = config['TAU']
-        self.alpha = config['ALPHA']
-        self.beta = config['BETA']
-        self.lr = config['LR']
+        # Coerce numeric hyperparameters to float. They can arrive as STRINGS:
+        # PyYAML 1.1 parses scientific notation without a decimal point (e.g.
+        # `3e-05`, which json.dumps emits for 0.00003) as a str, which then
+        # reaches optim.Adam(lr=...) and crashes ("'<=' not supported between
+        # instances of 'float' and 'str'"). float() here makes every LR/discount
+        # value robust regardless of how it was serialized upstream.
+        self.gamma = float(config['GAMMA'])
+        self.tau = float(config['TAU'])
+        self.alpha = float(config['ALPHA'])
+        self.beta = float(config['BETA'])
+        self.lr = float(config['LR'])
 
         # Phase 4 — independent GSP head learning rate.
         # Default: same value as the trunk/actor LR (config['LR']), preserving

@@ -83,7 +83,9 @@ class DDQN(nn.Module):
             self.ln1 = nn.LayerNorm(fc1_dims)
             self.ln2 = nn.LayerNorm(fc2_dims)
 
-        self.optimizer = optim.Adam(self.parameters(), lr = lr, weight_decay = 1e-4)
+        # float(lr): a YAML-sourced sci-notation LR (e.g. '3e-05') can arrive as
+        # a str and crash Adam's `0.0 <= lr` check. Defensive at the call site.
+        self.optimizer = optim.Adam(self.parameters(), lr = float(lr), weight_decay = 1e-4)
 
         self.loss = nn.SmoothL1Loss() if str(critic_loss).lower() == 'huber' else nn.MSELoss()
 
