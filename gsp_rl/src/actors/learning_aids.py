@@ -243,10 +243,14 @@ class Hyperparameters:
         self.actor_use_layer_norm = bool(config.get('ACTOR_USE_LAYER_NORM', False))
 
         # Per-episode diagnostics instrumentation (FAU, weight norms, effective
-        # rank, Q-gap, pred diversity). Default OFF to preserve legacy runs
-        # untouched. Opt-in via ``DIAGNOSTICS_ENABLED: true``. Spec:
-        # docs/specs/2026-04-17-diagnostics-instrumentation.md.
-        self.diagnostics_enabled = bool(config.get('DIAGNOSTICS_ENABLED', False))
+        # rank, Q-gap, pred diversity). Default ON — learning-health visibility
+        # should be the norm ("instrument from day one"), not an opt-in we forget
+        # to set (we ran the entire 2026-06 stability investigation blind because
+        # this defaulted off). The measurement is inert (no-grad forwards; backward
+        # probes zero grads before/after) so it cannot perturb training. Set
+        # ``DIAGNOSTICS_ENABLED: false`` to disable for a pure-throughput run.
+        # Spec: docs/specs/2026-04-17-diagnostics-instrumentation.md.
+        self.diagnostics_enabled = bool(config.get('DIAGNOSTICS_ENABLED', True))
         self.diagnostics_freeze_episode = int(config.get('DIAGNOSTICS_FREEZE_EPISODE', 50))
         self.diagnostics_cadence = int(config.get('DIAGNOSTICS_CADENCE', 10))
         self.diagnostics_batch_size = int(config.get('DIAGNOSTICS_BATCH_SIZE', 1024))
