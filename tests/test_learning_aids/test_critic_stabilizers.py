@@ -120,3 +120,15 @@ def test_ddqn_constructs_with_string_lr():
     # '3e-05' as a str previously crashed Adam('<=' float vs str)
     net = DDQN(id=1, lr='3e-05', input_size=4, output_size=2)
     assert net.optimizer.param_groups[0]['lr'] == 3e-05
+
+
+# --- diagnostics now default ON (instrument from day one) -------------------
+
+def test_diagnostics_enabled_defaults_true():
+    na = NetworkAids(copy.deepcopy(BASE_CONFIG))
+    assert na.diagnostics_enabled is True
+
+
+def test_diagnostics_can_be_disabled():
+    cfg = copy.deepcopy(BASE_CONFIG); cfg['DIAGNOSTICS_ENABLED'] = False
+    assert NetworkAids(cfg).diagnostics_enabled is False
