@@ -221,6 +221,13 @@ class Hyperparameters:
         self.grad_clip_norm = float(config.get('GRAD_CLIP_NORM', 0.0))
         self.reward_scale = float(config.get('REWARD_SCALE', 1.0))
         self.q_target_clip = float(config.get('Q_TARGET_CLIP', 0.0))
+        # ReDo plasticity intervention (Sokar 2023): periodically recycle dormant
+        # actor units (re-init incoming, zero outgoing, clear Adam). Default OFF —
+        # inert. Targets the gate-training seed variance that dormancy drives
+        # (dormancy<->success r=-0.54). REDO_FREQUENCY=0 also disables.
+        self.redo_enabled = bool(config.get('REDO_ENABLED', False))
+        self.redo_tau = float(config.get('REDO_TAU', 0.1))
+        self.redo_frequency = int(config.get('REDO_FREQUENCY', 1000))
         # Single configurable critic-loss fn used by every value-bootstrapping
         # update (DQN/DDQN/DDPG/RDDPG/TD3). 'mse' reproduces the legacy global
         # MSELoss / F.mse_loss exactly. Applied via the helpers below so all five
@@ -408,6 +415,21 @@ class NetworkAids(Hyperparameters):
         if self.grad_clip_norm > 0:
             for net in nets:
                 T.nn.utils.clip_grad_norm_(net.parameters(), self.grad_clip_norm)
+
+    def _maybe_redo(self, net, probe_states, step) -> None:
+        """Run ReDo dormant-unit recycling on the actor trunk every
+        REDO_FREQUENCY learn steps when enabled. Uses the current minibatch
+        states as the dormancy probe. Inert unless REDO_ENABLED and the net has
+        the fc1/fc2/fc3 trunk (DQN/DDQN)."""
+        if not self.redo_enabled or self.redo_frequency <= 0:
+            return
+        if step % self.redo_frequency != 0:
+            return
+        if not (hasattr(net, "fc1") and hasattr(net, "fc2") and hasattr(net, "fc3")):
+            return
+        from gsp_rl.src.actors.plasticity import redo_reset
+        redo_reset(net, probe_states, [("fc1", "fc2"), ("fc2", "fc3")],
+                   tau=self.redo_tau)
 
     def make_DQN_networks(self, nn_args):
         return {'q_eval':DQN(**nn_args), 'q_next':DQN(**nn_args)}
@@ -609,6 +631,7 @@ class NetworkAids(Hyperparameters):
         networks['q_eval'].optimizer.step()
 
         networks['learn_step_counter']+=1
+        self._maybe_redo(networks['q_eval'], states, networks['learn_step_counter'])
 
         self.decrement_epsilon()
 
