@@ -35,13 +35,17 @@ _learn_logger = logging.getLogger("stelaris.learn")
 
 
 def _check_nan(value, name):
-    """Raise RuntimeError if value is NaN or Inf. Works with floats and tensors."""
+    """Raise RuntimeError if value is NaN or Inf. Works with floats and tensors.
+
+    For tensors: a single (isnan | isinf).any() fuses two checks into one GPU
+    kernel, avoiding a redundant device sync vs. calling them separately.
+    """
     if isinstance(value, T.Tensor):
-        if T.isnan(value).any() or T.isinf(value).any():
-            raise RuntimeError(f"NaN detected in {name}: {value}")
+        if (T.isnan(value) | T.isinf(value)).any():
+            raise RuntimeError(f"NaN/Inf detected in {name}: {value}")
     else:
         if not np.isfinite(value):
-            raise RuntimeError(f"NaN detected in {name}: {value}")
+            raise RuntimeError(f"NaN/Inf detected in {name}: {value}")
 
 
 Loss = nn.MSELoss()
