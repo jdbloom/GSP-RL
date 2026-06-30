@@ -236,7 +236,7 @@ class Actor(NetworkAids):
             }
             self.networks = self.build_DQN(nn_args)
             self.networks['learning_scheme'] = 'DQN'
-            gsp_obs_sz = self.gsp_network_input if getattr(self, 'gsp_e2e_enabled', False) else 0
+            gsp_obs_sz = self.gsp_network_input if self.gsp_e2e_enabled else 0
             self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, 1, 'Discrete', gsp_obs_size=gsp_obs_sz)
             self.networks['learn_step_counter'] = 0
         elif learning_scheme == 'DDQN':
@@ -250,7 +250,7 @@ class Actor(NetworkAids):
             }
             self.networks = self.build_DDQN(nn_args)
             self.networks['learning_scheme'] = 'DDQN'
-            gsp_obs_sz = self.gsp_network_input if getattr(self, 'gsp_e2e_enabled', False) else 0
+            gsp_obs_sz = self.gsp_network_input if self.gsp_e2e_enabled else 0
             self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, 1, 'Discrete', gsp_obs_size=gsp_obs_sz)
             self.networks['learn_step_counter'] = 0
         elif learning_scheme == 'DDPG':
@@ -557,12 +557,12 @@ class Actor(NetworkAids):
             # entire run. Tests whether reward-shaping wins require head
             # learning at all, or whether reward density alone explains the
             # effect. Default false preserves all prior behavior.
-            if not getattr(self, 'gsp_head_frozen', False):
+            if not self.gsp_head_frozen:
                 if self.networks['learn_step_counter'] % self.gsp_learning_offset == 0:
                     #print('[DEBUG] Learning Attention', self.networks['learn_step_counter'])
                     self.learn_gsp()
 
-        if self.networks['learning_scheme'] == 'DDQN' and getattr(self, 'gsp_e2e_enabled', False) and self.gsp:
+        if self.networks['learning_scheme'] == 'DDQN' and self.gsp_e2e_enabled and self.gsp:
             self.replace_target_network()
             result = self.learn_DDQN_e2e(self.networks, self.gsp_networks)
             self.last_e2e_diagnostics = result

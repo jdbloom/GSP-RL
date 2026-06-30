@@ -664,7 +664,7 @@ class NetworkAids(Hyperparameters):
                 gsp_grad_norm_pre_clip, ddqn_grad_norm, gsp_input_grad,
                 gsp_pred_mean, gsp_pred_std, gsp_label_mean, gsp_label_std.
         """
-        e2e_lambda = float(getattr(self, 'gsp_e2e_lambda', 1.0))
+        e2e_lambda = self.gsp_e2e_lambda
         device = networks['q_eval'].device
 
         # --- 1. Sample 7 values directly from main replay ---
@@ -994,7 +994,7 @@ class NetworkAids(Hyperparameters):
         # heads and prevents the crash for RDDPG (R-GSP-N).
         networks['actor'].train()
 
-        vicreg_enabled = getattr(self, 'gsp_vicreg_enabled', False)
+        vicreg_enabled = self.gsp_vicreg_enabled
 
         if recurrent:
             mem_result = self.sample_memory(networks)
@@ -1031,8 +1031,8 @@ class NetworkAids(Hyperparameters):
             loss = mse_loss
 
             if vicreg_enabled and features is not None:
-                var_coef = float(getattr(self, 'gsp_vicreg_var_coef', 1.0))
-                cov_coef = float(getattr(self, 'gsp_vicreg_cov_coef', 0.04))
+                var_coef = self.gsp_vicreg_var_coef
+                cov_coef = self.gsp_vicreg_cov_coef
                 # Scale-aware target_std: match the batch's label std so the
                 # variance hinge doesn't force features to saturate the
                 # downstream tanh head. Clamp to >= 0.01 for numerical safety.
@@ -1049,7 +1049,7 @@ class NetworkAids(Hyperparameters):
             # so we subtract lambda * that quantity from the MSE loss.
             # Guard with hasattr so the path is robust against non-DDPG GSP heads
             # (attention variant does not have .fc1 / .fc2).
-            l2er_lambda = float(getattr(self, 'gsp_l2er_lambda', 0.0))
+            l2er_lambda = self.gsp_l2er_lambda
             if l2er_lambda > 0.0 and hasattr(networks['actor'], 'fc1'):
                 l2er_erank_sum = -gsp_l2er_loss(networks['actor'], states)
                 # gsp_l2er_loss returns -(erank1+erank2); negating yields erank_sum > 0.
@@ -1060,7 +1060,7 @@ class NetworkAids(Hyperparameters):
         # optimizer mutates the weights we can measure how much the function
         # changed on this same batch. This is C-CHAIN's "reference batch"
         # snapshot — Tang et al. 2506.00592 Eq. (3).
-        cchain_lambda = float(getattr(self, 'gsp_cchain_lambda', 0.0))
+        cchain_lambda = self.gsp_cchain_lambda
         if cchain_lambda > 0.0 and not recurrent:
             with T.no_grad():
                 pre_outputs = networks['actor'].forward(states).detach().clone()
@@ -1161,8 +1161,8 @@ class NetworkAids(Hyperparameters):
         if networks['replay'].mem_ctr < self.gsp_batch_size:
             return None
 
-        vicreg_enabled = getattr(self, 'gsp_vicreg_enabled', False)
-        tau = float(getattr(self, 'gsp_encoder_ema_tau', 0.995))
+        vicreg_enabled = self.gsp_vicreg_enabled
+        tau = self.gsp_encoder_ema_tau
         enc_device = self.gsp_encoder_online.device
 
         # Sample directly from the JEPA replay buffer rather than going through
@@ -1188,8 +1188,8 @@ class NetworkAids(Hyperparameters):
 
         # Optional VICReg on online encoder output z_t
         if vicreg_enabled:
-            var_coef = float(getattr(self, 'gsp_vicreg_var_coef', 1.0))
-            cov_coef = float(getattr(self, 'gsp_vicreg_cov_coef', 0.04))
+            var_coef = self.gsp_vicreg_var_coef
+            cov_coef = self.gsp_vicreg_cov_coef
             # target_std: 1.0 (standard VICReg default) — latent lives in
             # unbounded linear space so label-std normalization is not needed.
             var_loss = vicreg_variance_loss(z_t, target_std=1.0)
