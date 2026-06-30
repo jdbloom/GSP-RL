@@ -1,7 +1,8 @@
-"""Self-contained helpers for the T1 golden-equivalence gate.
+"""Self-contained helpers for the T1/T2 golden-equivalence gates.
 
-These freeze the CURRENT (baseline) behavior of the DQN/DDQN learn steps so a
-later INERT (behavior-preserving) optimization can be proven equivalent.
+These freeze the CURRENT (baseline) behavior of the DQN/DDQN/DDPG/TD3 learn
+steps so a later INERT (behavior-preserving) optimization can be proven
+equivalent.
 
 Construction idiom (CONFIG, INPUT_SIZE, output sizes) is copied verbatim from
 ``tests/test_learning_aids/test_base_learn.py`` so the exercised code paths
@@ -79,6 +80,9 @@ def one_learn_step(network: str) -> dict:
 
     Determinism contract: both buffer construction and the learn call are pinned
     with explicit numpy + torch seeds so the result is bit-reproducible on CPU/MPS.
+
+    Supports DQN and DDQN (discrete action space). For DDPG/TD3 use
+    ``one_learn_step_continuous``.
     """
     # Pin construction + buffer fill.
     np.random.seed(0)
@@ -96,4 +100,35 @@ def one_learn_step(network: str) -> dict:
         loss = actor.learn_DDQN(actor.networks)
 
     params = get_params_snapshot(actor.networks["q_eval"]).detach().cpu().numpy()
+    return {"loss": float(loss), "params": params}
+
+
+def one_learn_step_continuous(network: str) -> dict:
+    """Run one fully-deterministic learn step for DDPG or TD3.
+
+    Returns loss (actor_loss) + post-step actor-network params so the same
+    golden-equivalence pattern as DQN/DDQN can gate sample_memory changes.
+
+    Determinism contract: construction + fill pinned with seeds 0/0; learn call
+    re-pinned with 123/123 before sampling.
+    """
+    assert network in {"DDPG", "TD3"}, f"Unsupported network: {network}"
+
+    np.random.seed(0)
+    T.manual_seed(0)
+    actor = make_actor(network)
+    fill_buffer(actor, n=64, continuous=True)
+
+    np.random.seed(123)
+    T.manual_seed(123)
+    if network == "DDPG":
+        loss = actor.learn_DDPG(actor.networks)
+        params = get_params_snapshot(actor.networks["actor"]).detach().cpu().numpy()
+    else:
+        # TD3 returns (0, 0) on critic-only steps but with UPDATE_ACTOR_ITER=1
+        # it always updates the actor; normalise to a scalar.
+        result = actor.learn_TD3(actor.networks)
+        loss = float(result[0]) if isinstance(result, tuple) else float(result)
+        params = get_params_snapshot(actor.networks["actor"]).detach().cpu().numpy()
+
     return {"loss": float(loss), "params": params}
