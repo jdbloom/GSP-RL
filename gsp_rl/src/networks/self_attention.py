@@ -47,6 +47,10 @@ class SelfAttention(nn.Module):
 
         self.softmax = nn.Softmax(dim = 3)
 
+        # Cache the attention scale once at init — avoids recomputing embed_size**0.5
+        # on every forward call (T8 inert optimization).
+        self.scale = self.embed_size ** 0.5
+
     def forward(
             self,
             values: T.Tensor,
@@ -80,7 +84,7 @@ class SelfAttention(nn.Module):
         # energy shape = N, heads, query_len, key_len
         if mask is not None:
             energy = energy.masked_fill(mask == 0, float("-1e20"))
-        attention = self.softmax(energy / (self.embed_size**(1/2)))
+        attention = self.softmax(energy / self.scale)
 
         out = T.einsum("nhql, nlhd->nqhd", [attention, values]).reshape(N, query_len, self.heads*self.head_dim)
         # attention shape = N, heads, querry_len, key_len
@@ -216,6 +220,12 @@ class AttentionEncoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.tanh = nn.Tanh()
 
+        # Registered buffer: positional indices [0, 1, ..., max_length-1].
+        # Cached once in __init__ and moved to the correct device by .to(self.device)
+        # below, eliminating the per-forward T.arange(...).to(device) allocation
+        # (T8 inert optimization). In forward, slice [:seq_len] and expand to (N, seq_len).
+        self.register_buffer("pos_indices", T.arange(0, max_length, dtype=T.long))
+
         self.optimizer = optim.Adam(self.parameters(), lr = 0.0001  , weight_decay = 1e-4)
         self.to(self.device)
 
@@ -232,7 +242,9 @@ class AttentionEncoder(nn.Module):
             Prediction tensor of shape (N, output_size), bounded by min_max_action.
         """
         N, seq_len, obs_size = x.shape
-        positions = T.arange(0, seq_len).expand(N, seq_len).to(self.device)
+        # Use the pre-built registered buffer; slice to actual seq_len and expand
+        # to batch dim. No allocation, no device transfer (buffer already on self.device).
+        positions = self.pos_indices[:seq_len].expand(N, seq_len)
 
         out = self.word_embedding(x) + self.position_embedding(positions) 
         
