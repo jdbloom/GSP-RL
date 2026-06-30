@@ -11,7 +11,8 @@ Both changes must be purely inert — forward output must be bit-identical to th
 frozen baseline. The test loads frozen .npz references generated on the
 PRE-OPTIMIZATION baseline and compares against the current code.
 
-Device: forced to CPU via monkeypatch so the gate runs everywhere without MPS/CUDA.
+Device: forced to CPU via a pytest fixture so the monkeypatch is scoped to this
+file only and does not bleed into other test modules (test isolation).
 """
 import os
 
@@ -19,21 +20,25 @@ import numpy as np
 import pytest
 import torch as T
 
-# Force CPU in the module under test so the golden comparison is device-agnostic
-# and the test runs identically on CI (no MPS) and local Mac.
-import gsp_rl.src.networks.self_attention as _sa_mod
-_sa_mod.get_device = lambda recurrent=False: T.device("cpu")
-
-from gsp_rl.src.networks.self_attention import AttentionEncoder
-
 _REFS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden_refs")
 
 _RTOL = 1e-6
 _ATOL = 1e-6
 
 
-def _make_encoder() -> AttentionEncoder:
+@pytest.fixture(autouse=True)
+def _force_cpu(monkeypatch):
+    """Force get_device to return CPU so the gate is device-agnostic.
+
+    Scoped to this module only via pytest monkeypatch (reverted after each test).
+    """
+    import gsp_rl.src.networks.self_attention as _sa_mod
+    monkeypatch.setattr(_sa_mod, "get_device", lambda recurrent=False: T.device("cpu"))
+
+
+def _make_encoder():
     """Build a fixed-seed AttentionEncoder on CPU, eval mode (no dropout)."""
+    from gsp_rl.src.networks.self_attention import AttentionEncoder
     T.manual_seed(0)
     enc = AttentionEncoder(
         input_size=6,
@@ -51,7 +56,7 @@ def _make_encoder() -> AttentionEncoder:
     return enc
 
 
-def _forward(enc: AttentionEncoder, N: int, seed: int = 42) -> np.ndarray:
+def _forward(enc, N: int, seed: int = 42) -> np.ndarray:
     T.manual_seed(seed)
     x = T.randn(N, 5, 6)  # seq_len = max_length = 5
     with T.no_grad():
