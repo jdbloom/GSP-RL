@@ -671,13 +671,13 @@ class NetworkAids(Hyperparameters):
         result = networks['replay'].sample_buffer(self.batch_size)
         states_np, actions_np, rewards_np, states_np_, dones_np, gsp_obs_np, gsp_labels_np = result
 
-        states = T.tensor(states_np, dtype=T.float32).to(device)
-        actions = T.tensor(actions_np, dtype=T.float32).to(device)
-        rewards = T.tensor(rewards_np, dtype=T.float32).to(device)
-        states_ = T.tensor(states_np_, dtype=T.float32).to(device)
-        dones = T.tensor(dones_np).to(device)
-        gsp_obs = T.tensor(gsp_obs_np, dtype=T.float32).to(device)
-        gsp_labels = T.tensor(gsp_labels_np, dtype=T.float32).to(device)
+        states = T.as_tensor(states_np, dtype=T.float32).to(device)
+        actions = T.as_tensor(np.asarray(actions_np, dtype=np.float32)).to(device)
+        rewards = T.as_tensor(rewards_np, dtype=T.float32).to(device)
+        states_ = T.as_tensor(states_np_, dtype=T.float32).to(device)
+        dones = T.as_tensor(dones_np).to(device)
+        gsp_obs = T.as_tensor(gsp_obs_np, dtype=T.float32).to(device)
+        gsp_labels = T.as_tensor(gsp_labels_np, dtype=T.float32).to(device)
 
         # --- Zero both optimizers before any forward pass ---
         networks['q_eval'].optimizer.zero_grad()
@@ -1171,9 +1171,9 @@ class NetworkAids(Hyperparameters):
         # the encoder module itself.
         result = networks['replay'].sample_buffer(self.gsp_batch_size)
         raw_states, raw_future, _, _, _ = result[0], result[1], result[2], result[3], result[4]
-        states = T.tensor(raw_states, dtype=T.float32).to(enc_device)
+        states = T.as_tensor(raw_states, dtype=T.float32).to(enc_device)
         # future_states: stored in the 'action' slot by convention (state_{t+k})
-        future_states = T.tensor(raw_future, dtype=T.float32).to(enc_device)
+        future_states = T.as_tensor(raw_future, dtype=T.float32).to(enc_device)
 
         # Forward through online encoder + predictor
         z_t = self.gsp_encoder_online(states)
@@ -1254,32 +1254,35 @@ class NetworkAids(Hyperparameters):
                 states, actions, rewards, states_, dones = (
                     result[0], result[1], result[2], result[3], result[4]
                 )
-                states = T.tensor(states, dtype=T.float32).to(device)
-                actions = T.tensor(actions, dtype=T.float32).to(device)
-                rewards = T.tensor(rewards, dtype=T.float32).to(device)
-                states_ = T.tensor(states_, dtype=T.float32).to(device)
-                dones = T.tensor(dones).to(device)
+                # as_tensor avoids an intermediate CPU copy for float32 arrays;
+                # actions may be int-typed so pre-convert via numpy before as_tensor
+                # to avoid a dtype-change + device-transfer race on accelerator backends.
+                states = T.as_tensor(states, dtype=T.float32).to(device)
+                actions = T.as_tensor(np.asarray(actions, dtype=np.float32)).to(device)
+                rewards = T.as_tensor(rewards, dtype=T.float32).to(device)
+                states_ = T.as_tensor(states_, dtype=T.float32).to(device)
+                dones = T.as_tensor(dones).to(device)
                 return states, actions, rewards, states_, dones
             else:
                 # Sequence replay path: return all 7 (h_batch, c_batch are tensors/tuples).
                 states, actions, rewards, states_, dones, h_batch, c_batch = result
-                states = T.tensor(states, dtype=T.float32).to(device)
-                actions = T.tensor(actions, dtype=T.float32).to(device)
-                rewards = T.tensor(rewards, dtype=T.float32).to(device)
-                states_ = T.tensor(states_, dtype=T.float32).to(device)
-                dones = T.tensor(dones).to(device)
+                states = T.as_tensor(states, dtype=T.float32).to(device)
+                actions = T.as_tensor(np.asarray(actions, dtype=np.float32)).to(device)
+                rewards = T.as_tensor(rewards, dtype=T.float32).to(device)
+                states_ = T.as_tensor(states_, dtype=T.float32).to(device)
+                dones = T.as_tensor(dones).to(device)
                 return states, actions, rewards, states_, dones, h_batch, c_batch
         else:
             states, actions, rewards, states_, dones = result
-            states = T.tensor(states, dtype=T.float32).to(device)
-            actions = T.tensor(actions, dtype=T.float32).to(device)
-            rewards = T.tensor(rewards, dtype=T.float32).to(device)
-            states_ = T.tensor(states_, dtype=T.float32).to(device)
-            dones = T.tensor(dones).to(device)
+            states = T.as_tensor(states, dtype=T.float32).to(device)
+            actions = T.as_tensor(np.asarray(actions, dtype=np.float32)).to(device)
+            rewards = T.as_tensor(rewards, dtype=T.float32).to(device)
+            states_ = T.as_tensor(states_, dtype=T.float32).to(device)
+            dones = T.as_tensor(dones).to(device)
             return states, actions, rewards, states_, dones
 
     def sample_attention_memory(self, networks):
         observations, labels = networks['replay'].sample_buffer(self.batch_size)
-        observations = T.tensor(observations, dtype = T.float32).to(networks['attention'].device)
-        labels = T.tensor(labels, dtype = T.float32).to(networks['attention'].device)
+        observations = T.as_tensor(observations, dtype=T.float32).to(networks['attention'].device)
+        labels = T.as_tensor(labels, dtype=T.float32).to(networks['attention'].device)
         return observations, labels

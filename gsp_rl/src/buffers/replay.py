@@ -56,6 +56,9 @@ class ReplayBuffer():
         if self.gsp_obs_size > 0:
             self.gsp_obs_memory = np.zeros((self.mem_size, gsp_obs_size), dtype=np.float32)
             self.gsp_label_memory = np.zeros((self.mem_size, 1), dtype=np.float32)
+            # Cache a zero vector to avoid allocating np.zeros on every None-store.
+            self._zero_gsp_obs = np.zeros(gsp_obs_size, dtype=np.float32)
+            self._zero_gsp_label = np.zeros(1, dtype=np.float32)
 
 
     def store_transition(
@@ -89,12 +92,10 @@ class ReplayBuffer():
         self.terminal_memory[mem_index] = done
         if self.gsp_obs_size > 0:
             self.gsp_obs_memory[mem_index] = (
-                gsp_obs if gsp_obs is not None
-                else np.zeros(self.gsp_obs_size, dtype=np.float32)
+                gsp_obs if gsp_obs is not None else self._zero_gsp_obs
             )
             self.gsp_label_memory[mem_index] = (
-                gsp_label if gsp_label is not None
-                else np.zeros(1, dtype=np.float32)
+                gsp_label if gsp_label is not None else self._zero_gsp_label
             )
         self.mem_ctr += 1
         
