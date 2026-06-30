@@ -405,7 +405,10 @@ class NetworkAids(Hyperparameters):
         """Reward-scaled, optionally target-clipped Bellman target.
         `rewards` and `bootstrap` must already be broadcast-compatible (callers
         match the original per-algorithm shaping)."""
-        target = self.reward_scale * rewards + self.gamma * bootstrap
+        if self.reward_scale == 1.0:
+            target = rewards + self.gamma * bootstrap
+        else:
+            target = self.reward_scale * rewards + self.gamma * bootstrap
         if self.q_target_clip > 0:
             target = T.clamp(target, -self.q_target_clip, self.q_target_clip)
         return target
@@ -581,9 +584,9 @@ class NetworkAids(Hyperparameters):
 
         states, actions, rewards, states_, dones = self.sample_memory(networks)
 
-        indices = T.LongTensor(np.arange(self.batch_size).astype(np.int64))
+        indices = T.arange(self.batch_size, device=networks['q_eval'].device)
 
-        q_pred = networks['q_eval'](states)[indices, actions.type(T.LongTensor)]
+        q_pred = networks['q_eval'](states)[indices, actions.long()]
 
         q_next = networks['q_next'](states_).max(dim=1)[0]
 
@@ -591,7 +594,7 @@ class NetworkAids(Hyperparameters):
 
         q_target = self._q_target(rewards, q_next)
 
-        loss = self._critic_loss_fn(q_target, q_pred).to(networks['q_eval'].device)
+        loss = self._critic_loss_fn(q_target, q_pred)
         loss.backward()
         _check_nan(loss, f"DQN loss at step {networks['learn_step_counter']}")
         self._clip_critic_grad(networks['q_eval'])
@@ -609,9 +612,9 @@ class NetworkAids(Hyperparameters):
 
         states, actions, rewards, states_, dones = self.sample_memory(networks)
 
-        indices = T.LongTensor(np.arange(self.batch_size).astype(np.int64))
+        indices = T.arange(self.batch_size, device=networks['q_eval'].device)
 
-        q_pred = networks['q_eval'](states)[indices, actions.type(T.LongTensor)]
+        q_pred = networks['q_eval'](states)[indices, actions.long()]
 
         q_next = networks['q_next'](states_)
         q_eval = networks['q_eval'](states_)
@@ -622,7 +625,7 @@ class NetworkAids(Hyperparameters):
 
         q_target = self._q_target(rewards, q_next[indices, max_actions])
 
-        loss = self._critic_loss_fn(q_target, q_pred).to(networks['q_eval'].device)
+        loss = self._critic_loss_fn(q_target, q_pred)
 
         loss.backward()
         _check_nan(loss, f"DDQN loss at step {networks['learn_step_counter']}")
