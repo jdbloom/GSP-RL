@@ -2,7 +2,8 @@
 
 T2 targets (all bit-exact, no precision change):
 - sample_memory and per-scheme sample blocks: replace T.tensor(numpy).to(device)
-  double-copy with T.as_tensor/from_numpy + single .to(device, non_blocking=True).
+  double-copy with T.as_tensor(...).to(device), eliminating the intermediate CPU
+  allocation for float32 arrays.
 - ReplayBuffer.store_transition: cache a zero gsp_obs vector instead of
   allocating np.zeros(...) per None-store.
 

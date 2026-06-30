@@ -5,9 +5,10 @@ Run from the repo root with:
     python tests/test_learning_aids/freeze_t2.py
 
 T2 target: replace T.tensor(numpy).to(device) double-copies with
-T.as_tensor/from_numpy + single .to(device, non_blocking=True) in
-sample_memory and the per-scheme sample blocks, and cache the zero gsp_obs
-vector in ReplayBuffer.store_transition.  All changes are INERT (bit-exact).
+T.as_tensor(...).to(device) in sample_memory and the per-scheme sample blocks,
+eliminating the intermediate CPU allocation for float32 arrays, and cache the
+zero gsp_obs vector in ReplayBuffer.store_transition.  All changes are INERT
+(bit-exact).
 
 This freeze captures the PRE-OPTIMIZATION baseline for DQN, DDQN, DDPG, and
 TD3 learn steps so that after the patch test_golden_t2.py compares optimized

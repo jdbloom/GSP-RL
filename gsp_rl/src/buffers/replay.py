@@ -57,8 +57,12 @@ class ReplayBuffer():
             self.gsp_obs_memory = np.zeros((self.mem_size, gsp_obs_size), dtype=np.float32)
             self.gsp_label_memory = np.zeros((self.mem_size, 1), dtype=np.float32)
             # Cache a zero vector to avoid allocating np.zeros on every None-store.
+            # Write-protect so any accidental mutation raises immediately rather
+            # than silently corrupting future None-stores.
             self._zero_gsp_obs = np.zeros(gsp_obs_size, dtype=np.float32)
+            self._zero_gsp_obs.flags.writeable = False
             self._zero_gsp_label = np.zeros(1, dtype=np.float32)
+            self._zero_gsp_label.flags.writeable = False
 
 
     def store_transition(
