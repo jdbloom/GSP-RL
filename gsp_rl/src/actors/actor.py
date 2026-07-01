@@ -186,7 +186,8 @@ class Actor(NetworkAids):
                 self.gsp_networks['learning_scheme'] = 'JEPA'
                 self.gsp_networks['replay'] = ReplayBuffer(
                     self.mem_size, self.gsp_network_input,
-                    self.gsp_network_input, 'Continuous'
+                    self.gsp_network_input, 'Continuous',
+                    recency_halflife=self.recency_halflife,
                 )
                 self.gsp_networks['learn_step_counter'] = 0
                 self.gsp_networks['output_size'] = _enc_dim
@@ -237,7 +238,7 @@ class Actor(NetworkAids):
             self.networks = self.build_DQN(nn_args)
             self.networks['learning_scheme'] = 'DQN'
             gsp_obs_sz = self.gsp_network_input if self.gsp_e2e_enabled else 0
-            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, 1, 'Discrete', gsp_obs_size=gsp_obs_sz)
+            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, 1, 'Discrete', gsp_obs_size=gsp_obs_sz, recency_halflife=self.recency_halflife)
             self.networks['learn_step_counter'] = 0
         elif learning_scheme == 'DDQN':
             nn_args = {
@@ -251,7 +252,7 @@ class Actor(NetworkAids):
             self.networks = self.build_DDQN(nn_args)
             self.networks['learning_scheme'] = 'DDQN'
             gsp_obs_sz = self.gsp_network_input if self.gsp_e2e_enabled else 0
-            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, 1, 'Discrete', gsp_obs_size=gsp_obs_sz)
+            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, 1, 'Discrete', gsp_obs_size=gsp_obs_sz, recency_halflife=self.recency_halflife)
             self.networks['learn_step_counter'] = 0
         elif learning_scheme == 'DDPG':
             actor_nn_args = {
@@ -268,7 +269,7 @@ class Actor(NetworkAids):
                 }
             self.networks = self.build_DDPG(actor_nn_args, critic_nn_args)
             self.networks['learning_scheme'] = 'DDPG'
-            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, self.output_size, 'Continuous')
+            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, self.output_size, 'Continuous', recency_halflife=self.recency_halflife)
             self.networks['output_size'] = self.output_size
             self.networks['learn_step_counter'] = 0
         elif learning_scheme == "RDDPG":
@@ -295,7 +296,7 @@ class Actor(NetworkAids):
                 }
             self.networks = self.build_RDDPG()
             self.networks['learning_scheme'] = 'RDDPG'
-            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, self.output_size, 'Continuous')
+            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, self.output_size, 'Continuous', recency_halflife=self.recency_halflife)
             self.networks['output_size'] = self.output_size
             self.networks['learn_step_counter'] = 0
         elif learning_scheme == 'TD3':
@@ -317,7 +318,7 @@ class Actor(NetworkAids):
                 'output_size':self.output_size}
             self.networks = self.build_TD3(actor_nn_args, critic_nn_args)
             self.networks['learning_scheme'] = 'TD3'
-            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, self.output_size, 'Continuous')
+            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, self.output_size, 'Continuous', recency_halflife=self.recency_halflife)
             self.networks['output_size'] = self.output_size
             self.networks['learn_step_counter'] = 0
         else:
@@ -373,7 +374,7 @@ class Actor(NetworkAids):
                     self.gsp_networks = self.build_DDPG_gsp()
                     self.gsp_networks['learning_scheme'] = 'DDPG'
                     self.gsp_networks['output_size'] = self.gsp_network_output
-                    self.gsp_networks['replay'] = ReplayBuffer(self.mem_size, self.gsp_network_input, self.gsp_network_output, 'Continuous')
+                    self.gsp_networks['replay'] = ReplayBuffer(self.mem_size, self.gsp_network_input, self.gsp_network_output, 'Continuous', recency_halflife=self.recency_halflife)
                     self.gsp_networks['learn_step_counter'] = 0
             elif learning_scheme == 'TD3':
                 if self.recurrent_gsp:
@@ -386,7 +387,7 @@ class Actor(NetworkAids):
                     self.gsp_networks = self.build_TD3_gsp()
                     self.gsp_networks['learning_scheme'] = 'TD3'
                     self.gsp_networks['output_size'] = 1
-                    self.gsp_networks['replay'] = ReplayBuffer(self.mem_size, self.gsp_network_input, self.gsp_network_output, 'Continuous')
+                    self.gsp_networks['replay'] = ReplayBuffer(self.mem_size, self.gsp_network_input, self.gsp_network_output, 'Continuous', recency_halflife=self.recency_halflife)
                     self.gsp_networks['learn_step_counter'] = 0
             else:
                 raise Exception('[Error] gsp learning scheme is not recognised: '+learning_scheme)
