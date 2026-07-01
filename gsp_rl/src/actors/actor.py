@@ -478,8 +478,32 @@ class Actor(NetworkAids):
             self.networks = self.update_TD3_network_parameters(tau, self.networks)
 
     def replace_target_network(self):
-        if self.networks['learn_step_counter'] % self.replace_target_ctr==0:
-            self.networks['q_next'].load_state_dict(self.networks['q_eval'].state_dict())
+        """Update q_next toward q_eval.
+
+        SOFT_TARGET_TAU == 0 (default): hard copy every REPLACE_TARGET_COUNTER
+        learn steps — bit-identical to all prior behavior.
+
+        SOFT_TARGET_TAU > 0: apply a Polyak soft update every learn step
+        (q_next ← tau*q_eval + (1-tau)*q_next per parameter) and skip the
+        periodic hard reset entirely. Mirrors the DDPG/TD3 copy_ pattern from
+        update_DDPG_network_parameters().
+        """
+        tau = self.soft_target_tau
+        if tau > 0.0:
+            # Soft Polyak update every step — hard reset does NOT fire.
+            for target_param, online_param in zip(
+                self.networks['q_next'].parameters(),
+                self.networks['q_eval'].parameters(),
+            ):
+                target_param.data.copy_(
+                    target_param.data * (1.0 - tau) + online_param.data * tau
+                )
+        else:
+            # Hard copy on the counter cadence — exact legacy behavior.
+            if self.networks['learn_step_counter'] % self.replace_target_ctr == 0:
+                self.networks['q_next'].load_state_dict(
+                    self.networks['q_eval'].state_dict()
+                )
  
     def choose_action(self, observation, networks, test=False):        
         if networks['learning_scheme'] in {'DQN', 'DDQN'}:
