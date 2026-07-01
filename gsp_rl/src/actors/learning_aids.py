@@ -232,6 +232,14 @@ class Hyperparameters:
         # sampled exponentially more often — the primary stabilizer for
         # target-reset value disruption in gate training.
         self.recency_halflife = float(config.get('RECENCY_HALFLIFE', 0.0))
+        # Polyak (soft) target-network update for DQN/DDQN q_next.
+        # 0.0 (default) = OFF: preserve exact current behavior — hard copy
+        # every REPLACE_TARGET_COUNTER learn steps (bit-identical to all prior
+        # runs). When > 0, apply a soft Polyak update q_next ← tau*q_eval +
+        # (1-tau)*q_next EVERY learn step and SKIP the periodic hard reset.
+        # Mirrors the DDPG/TD3 update_DDPG_network_parameters() pattern using
+        # param.data.copy_() in-place. DDPG/TD3 are unchanged.
+        self.soft_target_tau = float(config.get('SOFT_TARGET_TAU', 0.0))
         # ReDo plasticity intervention (Sokar 2023): periodically recycle dormant
         # actor units (re-init incoming, zero outgoing, clear Adam). Default OFF —
         # inert. Targets the gate-training seed variance that dormancy drives
