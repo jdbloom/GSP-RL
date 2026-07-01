@@ -226,6 +226,12 @@ class Hyperparameters:
         self.grad_clip_norm = float(config.get('GRAD_CLIP_NORM', 0.0))
         self.reward_scale = float(config.get('REWARD_SCALE', 1.0))
         self.q_target_clip = float(config.get('Q_TARGET_CLIP', 0.0))
+        # Recency-weighted replay: exponential half-life (in stores) for the
+        # sampling probability.  0 (default) = OFF, uniform sampling,
+        # bit-identical to all prior runs.  When > 0, recent transitions are
+        # sampled exponentially more often — the primary stabilizer for
+        # target-reset value disruption in gate training.
+        self.recency_halflife = float(config.get('RECENCY_HALFLIFE', 0.0))
         # ReDo plasticity intervention (Sokar 2023): periodically recycle dormant
         # actor units (re-init incoming, zero outgoing, clear Adam). Default OFF —
         # inert. Targets the gate-training seed variance that dormancy drives
