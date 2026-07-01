@@ -1,6 +1,8 @@
 """Standard SARSD experience replay buffer with circular indexing.
 
 Used by DQN, DDQN, DDPG, TD3, and GSP-DDPG for uniform random experience replay.
+Supports optional recency-weighted sampling (exponential half-life) for gate-training
+stabilization — default OFF (recency_halflife=0), bit-identical to the prior implementation.
 
 See Also: docs/modules/buffers.md
 """
@@ -11,12 +13,20 @@ class ReplayBuffer():
     """Fixed-size circular buffer storing (State, Action, Reward, next_State, Done) tuples.
 
     Supports both discrete (1D int actions) and continuous (2D float actions)
-    action types. Sampling is uniform random without replacement.
+    action types.  Default sampling is uniform random without replacement.
+
+    Optional recency-weighted sampling: when recency_halflife > 0, each valid slot
+    is weighted by exp(-age/recency_halflife) where age = (mem_ctr-1-i) % max_mem
+    (age 0 = most-recent store).  Handles both the not-yet-full and the wrapped
+    circular-buffer cases correctly.  When recency_halflife <= 0 (default), the
+    code path is IDENTICAL to the prior implementation — no ``p=`` argument, no
+    extra RNG consumption, bit-exact reproducibility for all prior runs.
 
     Attributes:
         mem_size: Maximum buffer capacity.
         mem_ctr: Total transitions stored (unbounded, used for circular indexing).
         action_type: 'Discrete' or 'Continuous'.
+        recency_halflife: Exponential half-life for recency weighting (0 = OFF).
         state_memory: Array of shape (mem_size, num_observations).
         action_memory: Array of shape (mem_size,) for discrete or (mem_size, num_actions) for continuous.
     """
@@ -27,6 +37,7 @@ class ReplayBuffer():
             num_actions: int,
             action_type: str = None,
             gsp_obs_size: int = 0,
+            recency_halflife: float = 0,
     ) -> None:
         """Initialize replay buffer.
 
@@ -38,11 +49,17 @@ class ReplayBuffer():
             gsp_obs_size: When > 0, allocates parallel gsp_obs_memory of shape
                 (max_size, gsp_obs_size) and gsp_label_memory of shape (max_size, 1)
                 for co-indexed GSP observation and Δθ label storage.
+            recency_halflife: Exponential half-life (in buffer stores) for recency-
+                weighted sampling.  0 (default) = OFF: uniform sampling, bit-identical
+                to all prior runs.  When > 0, recent transitions are sampled
+                exponentially more often — primary stabilizer for target-reset value
+                disruption in gate training.
         """
         self.mem_size = max_size
         self.mem_ctr = 0
         self.action_type = action_type
         self.gsp_obs_size = gsp_obs_size
+        self.recency_halflife = recency_halflife
         self.state_memory = np.zeros((self.mem_size, num_observations), dtype = np.float32)
         self.new_state_memory = np.zeros((self.mem_size, num_observations), dtype = np.float32)
         if self.action_type == 'Discrete':
@@ -105,7 +122,16 @@ class ReplayBuffer():
         
 
     def sample_buffer(self, batch_size: int) -> tuple[np.ndarray, ...]:
-        """Sample a random batch of experiences from the buffer.
+        """Sample a batch of experiences from the buffer.
+
+        When recency_halflife <= 0 (OFF): uniform random without replacement —
+        IDENTICAL to the prior implementation (no ``p=`` argument, no extra RNG
+        consumption).  Existing runs are bit-identical.
+
+        When recency_halflife > 0 (ON): exponential recency weighting.  Age of
+        physical slot i is ``(mem_ctr - 1 - i) % max_mem`` so age 0 = most
+        recent store.  Weight = exp(-age / recency_halflife), normalised to a
+        probability vector over the ``max_mem`` valid indices.
 
         Returns:
             When gsp_obs_size == 0 (legacy path):
@@ -117,7 +143,20 @@ class ReplayBuffer():
         """
         max_mem = min(self.mem_ctr, self.mem_size)
 
-        batch = np.random.choice(max_mem, batch_size, replace=False)
+        if self.recency_halflife <= 0:
+            # OFF path: exact prior code — no p= argument, bit-identical.
+            batch = np.random.choice(max_mem, batch_size, replace=False)
+        else:
+            # ON path: exponential recency weighting.
+            # ages[i] = number of stores since slot i was written.
+            # Unified formula handles both not-yet-full and wrapped cases:
+            #   not-yet-full (mem_ctr <= mem_size): ages in [0, mem_ctr-1], no wrap.
+            #   full/wrapped (mem_ctr > mem_size): ages mod mem_size, wraps correctly.
+            ages = (self.mem_ctr - 1 - np.arange(max_mem)) % max_mem
+            raw_weights = np.exp(-ages.astype(np.float64) / self.recency_halflife)
+            weights = raw_weights / raw_weights.sum()
+            batch = np.random.choice(max_mem, batch_size, replace=False, p=weights)
+
         states = self.state_memory[batch]
         actions = self.action_memory[batch]
         rewards = self.reward_memory[batch]
