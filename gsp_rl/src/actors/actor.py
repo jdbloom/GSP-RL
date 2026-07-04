@@ -882,6 +882,66 @@ class Actor(NetworkAids):
 
         return out
 
+    @staticmethod
+    def _compute_actor_usage_metrics(net, batch: T.Tensor, pred_slice: slice) -> dict:
+        """Measure whether the actor's Q-network depends on the GSP prediction
+        dims (the ``pred_slice`` columns of its augmented input).
+
+        Two metrics (2026-07-04 actor-usage pre-registration):
+
+        - ``diag_gsp_actor_saliency``: input-saliency ratio. On a detached clone
+          of the frozen eval batch with ``requires_grad_(True)``, backprop the
+          scalar ``Q(x).max(dim=1).values.sum()`` (for vector outputs) and take
+          ``g = |x.grad|``. The ratio is ``mean(g[:, pred]) / mean(g[:, other])``.
+          >> 1 means the Q-value is driven by the prediction; ~0 means ignored.
+        - ``diag_gsp_actor_saliency_abs``: the raw ``mean(g[:, pred])`` (absolute
+          pred saliency, un-normalized).
+
+        The saliency computation runs a backward pass on a SEPARATE graph over a
+        cloned/detached batch — it never touches the network's ``.grad`` buffers
+        used by the real optimizer, and it restores the prior grad-enabled state.
+        On NaN/inf, emits ``diag_gsp_actor_saliency = 0.0`` plus
+        ``diag_gsp_actor_saliency_nan = 1.0``.
+        """
+        out: dict = {}
+        in_dim = net.fc1.weight.shape[1]
+        # Boolean mask for the non-pred ("other") columns.
+        other_mask = T.ones(in_dim, dtype=T.bool, device=net.fc1.weight.device)
+        other_mask[pred_slice] = False
+
+        # --- M1: dQ/d(pred) saliency ---
+        # Run on a detached clone so the real optimizer's gradient buffers are
+        # untouched. torch.enable_grad() forces autograd even inside a caller's
+        # no-grad diagnostics context.
+        prev_grad_enabled = T.is_grad_enabled()
+        try:
+            with T.enable_grad():
+                x = batch.detach().clone().requires_grad_(True)
+                q = net(x)
+                if q.dim() > 1:
+                    scalar = q.max(dim=1).values.sum()
+                else:
+                    scalar = q.sum()
+                grad = T.autograd.grad(scalar, x, retain_graph=False, create_graph=False)[0]
+            g = grad.abs()
+            sal_pred = g[:, pred_slice].mean()
+            sal_other = g[:, other_mask].mean()
+            ratio = float(sal_pred / (sal_other + 1e-8))
+            abs_pred = float(sal_pred)
+            if not (math.isfinite(ratio) and math.isfinite(abs_pred)):
+                out['diag_gsp_actor_saliency'] = 0.0
+                out['diag_gsp_actor_saliency_abs'] = 0.0
+                out['diag_gsp_actor_saliency_nan'] = 1.0
+            else:
+                out['diag_gsp_actor_saliency'] = ratio
+                out['diag_gsp_actor_saliency_abs'] = abs_pred
+        finally:
+            # Never leak the diagnostic backward's grads onto the network's params.
+            net.zero_grad(set_to_none=True)
+            T.set_grad_enabled(prev_grad_enabled)
+
+        return out
+
     def compute_diagnostics(
         self,
         gsp_predictions_this_episode=None,
@@ -946,6 +1006,24 @@ class Actor(NetworkAids):
                     churn_after_state_dict=actor_after_state_dict,
                     diagnose_churn=diag_churn,
                 ))
+
+            # Actor-usage metrics (M1 saliency + M3 weight-on-pred). Only meaningful
+            # when GSP is enabled — that's when the actor's augmented input carries
+            # a pred slice as its LAST columns (actor.py:134-144:
+            # network_input_size = input_size + gsp_network_output). JEPA appends the
+            # encoder latent instead; use its width. Guard on the fc1 attribute so
+            # networks without a leading Linear layer are skipped safely.
+            if self.gsp and hasattr(main_net, 'fc1'):
+                if getattr(self, 'gsp_jepa_enabled', False):
+                    pred_width = int(getattr(self, 'gsp_encoder_dim', 32))
+                else:
+                    pred_width = int(self.gsp_network_output)
+                in_dim = main_net.fc1.weight.shape[1]
+                if 0 < pred_width <= in_dim:
+                    pred_slice = slice(in_dim - pred_width, in_dim)
+                    out.update(self._compute_actor_usage_metrics(
+                        main_net, actor_batch, pred_slice
+                    ))
 
         # --- Critic network diagnostics (opt-in via DIAGNOSE_CRITIC) ---
         if getattr(self, 'diagnose_critic', False):
