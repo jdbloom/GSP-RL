@@ -2,14 +2,17 @@
 weight-on-pred relative norm (M3).
 
 These measure whether the actor's Q-network actually *uses* the GSP prediction
-dims that are concatenated onto the tail of its augmented input vector. See the
-2026-07-04 actor-usage pre-registration.
+dims concatenated into its augmented input vector. See the 2026-07-04
+actor-usage pre-registration.
 
-The GSP prediction occupies the LAST ``self.gsp_network_output`` columns of the
-actor's augmented input (actor.py:134-144: ``network_input_size = input_size +
-gsp_network_output``). We construct a ``gsp=True`` DDQN actor so that pred slice
-exists, then seed the Q-network's first-layer weights to control whether the
-output depends on the pred dims or the non-pred dims.
+The GSP prediction begins at OFFSET ``self.input_size`` (the raw env_obs width,
+actor.py:79) and has width ``self.gsp_network_output`` (or ``gsp_encoder_dim``
+under JEPA). It is an offset slice, NOT a tail slice: make_agent_state
+concatenates ``(env_obs, gsp_slot, global_knowledge)``, so trailing columns
+(global_knowledge) may follow the prediction and the pred sits in the MIDDLE.
+We construct a ``gsp=True`` DDQN actor so the pred slice exists, then seed the
+Q-network's first-layer weights to control whether the output depends on the
+pred dims, the non-pred obs dims, or the trailing dims.
 
 M1 (``diag_gsp_actor_saliency``): mean |dQ/dx| over pred dims divided by mean
     |dQ/dx| over non-pred dims. >> 1 means the actor's Q-value is driven by the
@@ -218,3 +221,121 @@ class TestActorWnormPredRel:
         _inject_eval_batch(actor)
         result = actor.compute_diagnostics()
         assert math.isfinite(result["diag_gsp_actor_wnorm_pred_rel"])
+
+
+# =====================================================================================
+# Regression: OFFSET slice (not tail) when trailing dims follow the prediction.
+#
+# This is the global_knowledge case: make_agent_state concatenates
+# (env_obs, gsp_slot, global_knowledge), so the augmented input layout is
+# [obs (input_size) | pred (gsp_network_output) | trailing (global_knowledge)].
+# A tail-based slice would measure the trailing block instead of the pred block.
+# =====================================================================================
+
+TRAILING = 5  # simulated global_knowledge width
+
+
+def _widen_qnet_fc1_with_trailing(actor: Actor) -> None:
+    """Rebuild the Q-network's fc1 so its input width is
+    input_size + PRED_WIDTH + TRAILING, simulating [obs | pred | trailing].
+
+    The actor's book-kept self.input_size (offset) and gsp_network_output (pred
+    width) are unchanged, so compute_diagnostics derives
+    pred_slice = slice(INPUT_SIZE, INPUT_SIZE + PRED_WIDTH) — the MIDDLE block.
+    """
+    net = _q_net(actor)
+    hidden = net.fc1.weight.shape[0]
+    device = net.fc1.weight.device
+    new_in = INPUT_SIZE + PRED_WIDTH + TRAILING
+    new_fc1 = torch.nn.Linear(new_in, hidden).to(device)
+    with torch.no_grad():
+        new_fc1.weight.zero_()
+        new_fc1.bias.zero_()
+    net.fc1 = new_fc1
+
+
+def _inject_wide_eval_batch(actor: Actor, n: int = 64) -> None:
+    width = INPUT_SIZE + PRED_WIDTH + TRAILING
+    actor.diag_actor_eval_batch = np.random.randn(n, width).astype(np.float32)
+    actor.diag_gsp_eval_batch = None
+
+
+# Column index helpers for the [obs | pred | trailing] layout.
+_PRED_LO, _PRED_HI = INPUT_SIZE, INPUT_SIZE + PRED_WIDTH
+_TRAIL_LO, _TRAIL_HI = INPUT_SIZE + PRED_WIDTH, INPUT_SIZE + PRED_WIDTH + TRAILING
+
+
+class TestOffsetSliceWithTrailingDims:
+    def test_high_saliency_when_q_depends_only_on_pred_block(self):
+        """Q depends ONLY on the middle pred block → high pred saliency, even
+        though there are trailing (global_knowledge) columns after it."""
+        actor = _make_gsp_ddqn_actor()
+        _widen_qnet_fc1_with_trailing(actor)
+        _inject_wide_eval_batch(actor)
+        net = _q_net(actor)
+        with torch.no_grad():
+            net.fc1.weight[:, _PRED_LO:_PRED_HI] = torch.randn_like(
+                net.fc1.weight[:, _PRED_LO:_PRED_HI]
+            )
+        result = actor.compute_diagnostics()
+        assert "diag_gsp_actor_saliency" in result
+        assert result.get("diag_gsp_actor_saliency_nan", 0.0) == 0.0
+        assert result["diag_gsp_actor_saliency"] > 1.0
+
+    def test_low_saliency_when_q_depends_only_on_trailing_block(self):
+        """Q depends ONLY on the trailing (global_knowledge) block → pred
+        saliency must be LOW. A tail slice would WRONGLY report this as high
+        because it would measure the trailing columns. This is the regression
+        that catches the tail bug."""
+        actor = _make_gsp_ddqn_actor()
+        _widen_qnet_fc1_with_trailing(actor)
+        _inject_wide_eval_batch(actor)
+        net = _q_net(actor)
+        with torch.no_grad():
+            net.fc1.weight[:, _TRAIL_LO:_TRAIL_HI] = torch.randn_like(
+                net.fc1.weight[:, _TRAIL_LO:_TRAIL_HI]
+            )
+        result = actor.compute_diagnostics()
+        assert result.get("diag_gsp_actor_saliency_nan", 0.0) == 0.0
+        assert result["diag_gsp_actor_saliency"] < 0.1
+
+    def test_wnorm_offset_picks_pred_not_trailing(self):
+        """M3 column-norm ratio must key off the middle pred block, not trailing."""
+        actor = _make_gsp_ddqn_actor()
+        _widen_qnet_fc1_with_trailing(actor)
+        _inject_wide_eval_batch(actor)
+        net = _q_net(actor)
+        hidden = net.fc1.weight.shape[0]
+        in_dim = INPUT_SIZE + PRED_WIDTH + TRAILING
+        with torch.no_grad():
+            unit = torch.ones(hidden) / math.sqrt(hidden)  # unit-norm column
+            for c in range(in_dim):
+                # Pred columns get 10x; obs AND trailing columns get 1x.
+                scale = 10.0 if (_PRED_LO <= c < _PRED_HI) else 1.0
+                net.fc1.weight[:, c] = unit * scale
+        result = actor.compute_diagnostics()
+        # col_norm: PRED_WIDTH cols at 10.0, the rest (INPUT_SIZE + TRAILING) at 1.0.
+        mean_norm = (PRED_WIDTH * 10.0 + (INPUT_SIZE + TRAILING) * 1.0) / in_dim
+        expected = 10.0 / (mean_norm + 1e-8)
+        assert result["diag_gsp_actor_wnorm_pred_rel"] == pytest.approx(expected, rel=1e-3)
+
+
+class TestOffsetGuard:
+    def test_guard_emits_nan_sentinel_when_slot_cannot_fit(self):
+        """If fc1's input width is too small to hold [obs | pred] at the expected
+        offset, emit the NaN sentinel instead of mismeasuring."""
+        actor = _make_gsp_ddqn_actor()
+        net = _q_net(actor)
+        hidden = net.fc1.weight.shape[0]
+        # Shrink fc1 so input width < input_size + pred_width (base + pred > in_dim).
+        narrow_in = INPUT_SIZE  # no room for the pred block at offset INPUT_SIZE
+        device = net.fc1.weight.device
+        with torch.no_grad():
+            net.fc1 = torch.nn.Linear(narrow_in, hidden).to(device)
+        actor.diag_actor_eval_batch = np.random.randn(64, narrow_in).astype(np.float32)
+        actor.diag_gsp_eval_batch = None
+        result = actor.compute_diagnostics()
+        assert result["diag_gsp_actor_saliency"] == 0.0
+        assert result["diag_gsp_actor_saliency_nan"] == 1.0
+        # Must NOT have computed a (wrong) wnorm ratio for the missing slot.
+        assert "diag_gsp_actor_wnorm_pred_rel" not in result

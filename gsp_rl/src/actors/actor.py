@@ -887,6 +887,13 @@ class Actor(NetworkAids):
         """Measure whether the actor's Q-network depends on the GSP prediction
         dims (the ``pred_slice`` columns of its augmented input).
 
+        ``pred_slice`` is an OFFSET-based slice — ``slice(base, base + width)``
+        where ``base = self.input_size`` (raw env_obs width) — NOT a tail slice.
+        This is correct-by-construction even when trailing columns follow the
+        pred block (e.g. ``make_agent_state`` concatenates
+        ``(env_obs, gsp_slot, global_knowledge)``, putting global_knowledge AFTER
+        the prediction). See the call site in ``compute_diagnostics``.
+
         Two metrics (2026-07-04 actor-usage pre-registration):
 
         - ``diag_gsp_actor_saliency``: input-saliency ratio. On a detached clone
@@ -1018,21 +1025,33 @@ class Actor(NetworkAids):
 
             # Actor-usage metrics (M1 saliency + M3 weight-on-pred). Only meaningful
             # when GSP is enabled — that's when the actor's augmented input carries
-            # a pred slice as its LAST columns (actor.py:134-144:
-            # network_input_size = input_size + gsp_network_output). JEPA appends the
-            # encoder latent instead; use its width. Guard on the fc1 attribute so
-            # networks without a leading Linear layer are skipped safely.
+            # a GSP prediction slot. The slot is OFFSET-based, not tail-based:
+            # make_agent_state (RL-CollectiveTransport agent.py) concatenates
+            # (env_obs, gsp_slot, global_knowledge), so the pred begins immediately
+            # after env_obs at index self.input_size (the raw pre-GSP env width,
+            # actor.py:79) and has width gsp_network_output (or gsp_encoder_dim under
+            # JEPA). When global_knowledge is present the pred sits in the MIDDLE of
+            # the augmented vector, NOT at the tail — a tail slice would mismeasure.
+            # Guard on the fc1 attribute so networks without a leading Linear layer
+            # are skipped safely.
             if self.gsp and hasattr(main_net, 'fc1'):
                 if getattr(self, 'gsp_jepa_enabled', False):
                     pred_width = int(getattr(self, 'gsp_encoder_dim', 32))
                 else:
                     pred_width = int(self.gsp_network_output)
+                base = int(self.input_size)  # raw env_obs width; pred starts here
                 in_dim = main_net.fc1.weight.shape[1]
-                if 0 < pred_width <= in_dim:
-                    pred_slice = slice(in_dim - pred_width, in_dim)
+                if pred_width > 0 and base >= 0 and base + pred_width <= in_dim:
+                    pred_slice = slice(base, base + pred_width)
                     out.update(self._compute_actor_usage_metrics(
                         main_net, actor_batch, pred_slice
                     ))
+                else:
+                    # The pred slot can't sit where expected (misconfigured widths
+                    # or an fc1 input size that doesn't match input_size + pred).
+                    # Emit the NaN sentinel rather than silently mismeasure.
+                    out['diag_gsp_actor_saliency'] = 0.0
+                    out['diag_gsp_actor_saliency_nan'] = 1.0
 
         # --- Critic network diagnostics (opt-in via DIAGNOSE_CRITIC) ---
         if getattr(self, 'diagnose_critic', False):
