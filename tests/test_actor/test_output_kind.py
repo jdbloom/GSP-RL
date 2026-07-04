@@ -37,6 +37,7 @@ _OUTPUT_KIND_CASES = [
     ("cyl_kinematics_3d", 3),
     ("cyl_kinematics_goal_4d", 4),
     ("time_to_goal_1d", 1),
+    ("neighbor_force_1d", 1),
 ]
 
 

@@ -342,6 +342,13 @@ class Hyperparameters:
         #   'cyl_kinematics_3d'               O=3  — (cyl_Δx, cyl_Δy, cyl_Δθ) per step
         #   'cyl_kinematics_goal_4d'          O=4  — above + group_centroid_Δ_to_goal
         #   'time_to_goal_1d'                 O=1  — remaining steps to success (or 0)
+        #   'neighbor_force_1d'               O=1  — mean applied force-magnitude of
+        #                                            the OTHER robots K steps ahead
+        #                                            (delayed label; reuses the
+        #                                            future_prox FIFO). Coordination-
+        #                                            relevant target: correlates with
+        #                                            per-robot reward-to-go at |0.33|
+        #                                            vs delta_theta 0.06 (2026-07-04).
         #
         # gsp_output_size_effective is the O to use when building the GSP head.
         # The legacy gsp_output_size kwarg (from config['GSP_OUTPUT_SIZE']) is kept
@@ -353,6 +360,7 @@ class Hyperparameters:
             'cyl_kinematics_3d': 3,
             'cyl_kinematics_goal_4d': 4,
             'time_to_goal_1d': 1,
+            'neighbor_force_1d': 1,
         }
         self.gsp_output_kind = str(config.get('GSP_OUTPUT_KIND', 'delta_theta_1d'))
         if self.gsp_output_kind not in _GSP_OUTPUT_KIND_SIZES:
