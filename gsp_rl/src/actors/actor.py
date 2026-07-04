@@ -896,6 +896,9 @@ class Actor(NetworkAids):
           >> 1 means the Q-value is driven by the prediction; ~0 means ignored.
         - ``diag_gsp_actor_saliency_abs``: the raw ``mean(g[:, pred])`` (absolute
           pred saliency, un-normalized).
+        - ``diag_gsp_actor_wnorm_pred_rel``: first Linear layer weight ``W`` has
+          shape ``[hidden, in]``; ``col_norm = W.norm(dim=0)`` is the per-input
+          contribution. Emit ``mean(col_norm[pred]) / mean(col_norm)``.
 
         The saliency computation runs a backward pass on a SEPARATE graph over a
         cloned/detached batch — it never touches the network's ``.grad`` buffers
@@ -939,6 +942,12 @@ class Actor(NetworkAids):
             # Never leak the diagnostic backward's grads onto the network's params.
             net.zero_grad(set_to_none=True)
             T.set_grad_enabled(prev_grad_enabled)
+
+        # --- M3: weight-on-pred relative norm ---
+        with T.no_grad():
+            col_norm = net.fc1.weight.norm(dim=0)  # [in]
+            wnorm_rel = float(col_norm[pred_slice].mean() / (col_norm.mean() + 1e-8))
+        out['diag_gsp_actor_wnorm_pred_rel'] = wnorm_rel
 
         return out
 

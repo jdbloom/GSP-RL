@@ -170,4 +170,51 @@ class TestActorSaliency:
         assert isinstance(actor.diag_actor_eval_batch, np.ndarray)
 
 
-# M3 (diag_gsp_actor_wnorm_pred_rel) tests are added in the next commit.
+# =====================================================================================
+# M3: diag_gsp_actor_wnorm_pred_rel
+# =====================================================================================
+
+
+class TestActorWnormPredRel:
+    def test_wnorm_pred_rel_scales_with_pred_column_norm(self):
+        """Set pred columns to have 10x the norm of the non-pred columns →
+        wnorm_pred_rel ≈ 10 / (weighted mean)."""
+        actor = _make_gsp_ddqn_actor()
+        _inject_eval_batch(actor)
+        net = _q_net(actor)
+        in_dim = actor.network_input_size
+        hidden = net.fc1.weight.shape[0]
+        with torch.no_grad():
+            W = net.fc1.weight
+            # Give every non-pred column unit L2 norm, every pred column 10x.
+            base = torch.ones(hidden) / math.sqrt(hidden)  # column of unit norm
+            for c in range(in_dim):
+                scale = 10.0 if c >= INPUT_SIZE else 1.0
+                W[:, c] = base * scale
+
+        result = actor.compute_diagnostics()
+        assert "diag_gsp_actor_wnorm_pred_rel" in result
+        # col_norm: non-pred = 1.0 (INPUT_SIZE of them), pred = 10.0 (PRED_WIDTH).
+        mean_norm = (INPUT_SIZE * 1.0 + PRED_WIDTH * 10.0) / in_dim
+        expected = 10.0 / (mean_norm + 1e-8)
+        assert result["diag_gsp_actor_wnorm_pred_rel"] == pytest.approx(expected, rel=1e-3)
+
+    def test_wnorm_pred_rel_equals_one_when_uniform(self):
+        """Uniform column norms → ratio == 1."""
+        actor = _make_gsp_ddqn_actor()
+        _inject_eval_batch(actor)
+        net = _q_net(actor)
+        in_dim = actor.network_input_size
+        hidden = net.fc1.weight.shape[0]
+        with torch.no_grad():
+            base = torch.ones(hidden) / math.sqrt(hidden)
+            for c in range(in_dim):
+                net.fc1.weight[:, c] = base
+        result = actor.compute_diagnostics()
+        assert result["diag_gsp_actor_wnorm_pred_rel"] == pytest.approx(1.0, rel=1e-4)
+
+    def test_wnorm_pred_rel_finite(self):
+        actor = _make_gsp_ddqn_actor()
+        _inject_eval_batch(actor)
+        result = actor.compute_diagnostics()
+        assert math.isfinite(result["diag_gsp_actor_wnorm_pred_rel"])
