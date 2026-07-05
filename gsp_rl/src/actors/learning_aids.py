@@ -349,11 +349,30 @@ class Hyperparameters:
         #                                            relevant target: correlates with
         #                                            per-robot reward-to-go at |0.33|
         #                                            vs delta_theta 0.06 (2026-07-04).
+        #   'delta_theta_traj'                O=K  — payload-rotation TRAJECTORY over
+        #                                            the next K steps: the size-K vector
+        #                                            [Δθ(t→t+1), …, Δθ(t+K-1→t+K)], each
+        #                                            per-step rotation wrap-safe to
+        #                                            [-180,180) degrees (delayed label,
+        #                                            reuses the future_prox FIFO). The
+        #                                            head predicts the whole anticipated
+        #                                            rotation PATH, not just the endpoint;
+        #                                            neighbors ingest each other's size-K
+        #                                            path and the actor Q-net head ingests
+        #                                            it too. O is COUPLED to the horizon:
+        #                                            O = GSP_PREDICTION_HORIZON. At K=1 it
+        #                                            reduces to the legacy single-step
+        #                                            rotation (2026-07-05).
         #
         # gsp_output_size_effective is the O to use when building the GSP head.
         # The legacy gsp_output_size kwarg (from config['GSP_OUTPUT_SIZE']) is kept
         # for backward compat on non-GSP_OUTPUT_KIND runs; this field overrides it
         # when GSP_OUTPUT_KIND is set to a non-default value.
+        #
+        # A dict value of None marks a HORIZON-COUPLED kind whose output dim is not a
+        # fixed constant but equals GSP_PREDICTION_HORIZON. It is resolved from the
+        # SAME config key that the RL-CollectiveTransport host (agent.py) uses to size
+        # the actor/neighbor input, so head output width and input width always agree.
         _GSP_OUTPUT_KIND_SIZES = {
             'delta_theta_1d': 1,
             'future_prox_1d': 1,
@@ -361,6 +380,7 @@ class Hyperparameters:
             'cyl_kinematics_goal_4d': 4,
             'time_to_goal_1d': 1,
             'neighbor_force_1d': 1,
+            'delta_theta_traj': None,  # size == K == GSP_PREDICTION_HORIZON
         }
         self.gsp_output_kind = str(config.get('GSP_OUTPUT_KIND', 'delta_theta_1d'))
         if self.gsp_output_kind not in _GSP_OUTPUT_KIND_SIZES:
@@ -368,7 +388,16 @@ class Hyperparameters:
                 f"Unknown GSP_OUTPUT_KIND '{self.gsp_output_kind}'. "
                 f"Valid values: {list(_GSP_OUTPUT_KIND_SIZES)}"
             )
-        self.gsp_output_size_effective = _GSP_OUTPUT_KIND_SIZES[self.gsp_output_kind]
+        _kind_size = _GSP_OUTPUT_KIND_SIZES[self.gsp_output_kind]
+        if _kind_size is None:
+            # Horizon-coupled kind: output dim == GSP_PREDICTION_HORIZON.
+            _kind_size = int(self.gsp_prediction_horizon)
+            if _kind_size < 1:
+                raise ValueError(
+                    f"GSP_OUTPUT_KIND='{self.gsp_output_kind}' requires "
+                    f"GSP_PREDICTION_HORIZON >= 1, got {_kind_size}"
+                )
+        self.gsp_output_size_effective = _kind_size
 
         # Weight initialization scheme for the GSP head's hidden layers.
         # 'fanin' (default) preserves legacy behavior for all in-flight runs.
