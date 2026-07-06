@@ -38,6 +38,7 @@ class ReplayBuffer():
             action_type: str = None,
             gsp_obs_size: int = 0,
             recency_halflife: float = 0,
+            phi_size: int = 0,
     ) -> None:
         """Initialize replay buffer.
 
@@ -54,12 +55,17 @@ class ReplayBuffer():
                 to all prior runs.  When > 0, recent transitions are sampled
                 exponentially more often — primary stabilizer for target-reset value
                 disruption in gate training.
+            phi_size: When > 0, allocates a parallel phi_memory of shape
+                (max_size, phi_size) for the Successor-Features cumulant phi
+                (GSP_SF_ENABLED). 0 (default) = OFF, no allocation, bit-identical
+                to all prior runs.
         """
         self.mem_size = max_size
         self.mem_ctr = 0
         self.action_type = action_type
         self.gsp_obs_size = gsp_obs_size
         self.recency_halflife = recency_halflife
+        self.phi_size = phi_size
         self.state_memory = np.zeros((self.mem_size, num_observations), dtype = np.float32)
         self.new_state_memory = np.zeros((self.mem_size, num_observations), dtype = np.float32)
         if self.action_type == 'Discrete':
@@ -80,6 +86,10 @@ class ReplayBuffer():
             self._zero_gsp_obs.flags.writeable = False
             self._zero_gsp_label = np.zeros(1, dtype=np.float32)
             self._zero_gsp_label.flags.writeable = False
+        if self.phi_size > 0:
+            self.phi_memory = np.zeros((self.mem_size, phi_size), dtype=np.float32)
+            self._zero_phi = np.zeros(phi_size, dtype=np.float32)
+            self._zero_phi.flags.writeable = False
 
 
     def store_transition(
@@ -91,6 +101,7 @@ class ReplayBuffer():
             done: bool,
             gsp_obs: np.ndarray = None,
             gsp_label: np.ndarray = None,
+            phi: np.ndarray = None,
     ) -> None:
         """Store a SARSD experience, optionally with co-indexed GSP data.
 
@@ -104,6 +115,8 @@ class ReplayBuffer():
                 and gsp_obs_size > 0, zeros are stored at this index.
             gsp_label: Δθ label scalar as shape-(1,) array. When None and
                 gsp_obs_size > 0, zero is stored at this index.
+            phi: Successor-Features cumulant vector (phi_size floats). When None
+                and phi_size > 0, zeros are stored at this index.
         """
         mem_index = self.mem_ctr % self.mem_size
         self.state_memory[mem_index] = state
@@ -117,6 +130,10 @@ class ReplayBuffer():
             )
             self.gsp_label_memory[mem_index] = (
                 gsp_label if gsp_label is not None else self._zero_gsp_label
+            )
+        if self.phi_size > 0:
+            self.phi_memory[mem_index] = (
+                phi if phi is not None else self._zero_phi
             )
         self.mem_ctr += 1
         
@@ -141,21 +158,7 @@ class ReplayBuffer():
                 — 7 values, where gsp_obs and gsp_labels are co-indexed with the
                 main transition arrays.
         """
-        max_mem = min(self.mem_ctr, self.mem_size)
-
-        if self.recency_halflife <= 0:
-            # OFF path: exact prior code — no p= argument, bit-identical.
-            batch = np.random.choice(max_mem, batch_size, replace=False)
-        else:
-            # ON path: exponential recency weighting.
-            # ages[i] = number of stores since slot i was written.
-            # Unified formula handles both not-yet-full and wrapped cases:
-            #   not-yet-full (mem_ctr <= mem_size): ages in [0, mem_ctr-1], no wrap.
-            #   full/wrapped (mem_ctr > mem_size): ages mod mem_size, wraps correctly.
-            ages = (self.mem_ctr - 1 - np.arange(max_mem)) % max_mem
-            raw_weights = np.exp(-ages.astype(np.float64) / self.recency_halflife)
-            weights = raw_weights / raw_weights.sum()
-            batch = np.random.choice(max_mem, batch_size, replace=False, p=weights)
+        batch = self._sample_indices(batch_size)
 
         states = self.state_memory[batch]
         actions = self.action_memory[batch]
@@ -169,3 +172,47 @@ class ReplayBuffer():
             return states, actions, rewards, next_states, dones, gsp_obs, gsp_labels
 
         return states, actions, rewards, next_states, dones
+
+    def _sample_indices(self, batch_size: int) -> np.ndarray:
+        """Draw ``batch_size`` valid slot indices (uniform, or recency-weighted).
+
+        Factored out of :meth:`sample_buffer` so the Successor-Features sampler
+        reuses the identical index-selection logic. When recency_halflife <= 0
+        this is bit-identical to the prior inline code.
+        """
+        max_mem = min(self.mem_ctr, self.mem_size)
+        if self.recency_halflife <= 0:
+            # OFF path: exact prior code — no p= argument, bit-identical.
+            return np.random.choice(max_mem, batch_size, replace=False)
+        # ON path: exponential recency weighting.
+        # ages[i] = number of stores since slot i was written.
+        # Unified formula handles both not-yet-full and wrapped cases:
+        #   not-yet-full (mem_ctr <= mem_size): ages in [0, mem_ctr-1], no wrap.
+        #   full/wrapped (mem_ctr > mem_size): ages mod mem_size, wraps correctly.
+        ages = (self.mem_ctr - 1 - np.arange(max_mem)) % max_mem
+        raw_weights = np.exp(-ages.astype(np.float64) / self.recency_halflife)
+        weights = raw_weights / raw_weights.sum()
+        return np.random.choice(max_mem, batch_size, replace=False, p=weights)
+
+    def sample_buffer_sf(self, batch_size: int) -> tuple[np.ndarray, ...]:
+        """Sample a batch for the Successor-Features learn step (GSP_SF_ENABLED).
+
+        Requires phi_size > 0. Returns the SARSD tuple plus the co-indexed
+        cumulant phi:
+            (states, actions, rewards, next_states, dones, phi) — 6 values,
+            phi of shape (batch_size, phi_size).
+
+        Kept separate from :meth:`sample_buffer` so the legacy len(result)-based
+        dispatch in NetworkAids.sample_memory is untouched.
+        """
+        if self.phi_size <= 0:
+            raise ValueError("sample_buffer_sf requires phi_size > 0")
+        batch = self._sample_indices(batch_size)
+        return (
+            self.state_memory[batch],
+            self.action_memory[batch],
+            self.reward_memory[batch],
+            self.new_state_memory[batch],
+            self.terminal_memory[batch],
+            self.phi_memory[batch],
+        )
