@@ -136,6 +136,15 @@ class Actor(NetworkAids):
             if getattr(self, 'gsp_jepa_enabled', False):
                 # JEPA path: actor receives the full latent vector (encoder_dim)
                 # instead of the legacy scalar/K-dim GSP prediction.
+                # Latent-primary (GSP_ACTOR_LATENT_PRIMARY): the raw env-obs block
+                # is DROPPED from the Q-net input, so the actor is forced to route
+                # through the latent. network_input_size then starts from 0 (only
+                # latent + trailing neighbor/global block) instead of self.input_size.
+                # The runtime augmented-obs builder (RL-CollectiveTransport
+                # make_agent_state) and the coupled splice (learn_DDQN_jepa_coupled)
+                # drop env_obs in lockstep so the three input dims stay coherent.
+                if getattr(self, 'gsp_actor_latent_primary', False):
+                    self.network_input_size = 0
                 self.network_input_size += getattr(self, 'gsp_encoder_dim', 32)
             else:
                 # For multi-dim GSP output (gsp_output_kind != delta_theta_1d),
@@ -167,6 +176,10 @@ class Actor(NetworkAids):
                 self.gsp_encoder_online = JEPAEncoder(
                     input_dim=self.gsp_network_input,
                     latent_dim=_enc_dim,
+                    simnorm=getattr(self, 'gsp_jepa_simnorm', False),
+                    simnorm_group_size=getattr(
+                        self, 'gsp_jepa_simnorm_group_size', 8
+                    ),
                 )
                 # Target encoder: EMA copy — weights frozen, no gradient
                 self.gsp_encoder_target = copy.deepcopy(self.gsp_encoder_online)
@@ -1087,7 +1100,16 @@ class Actor(NetworkAids):
                     pred_width = int(getattr(self, 'gsp_encoder_dim', 32))
                 else:
                     pred_width = int(self.gsp_network_output)
-                base = int(self.input_size)  # raw env_obs width; pred starts here
+                # Latent-primary drops the raw env_obs block, so the latent (pred)
+                # slot begins at index 0 of the Q-net input; otherwise it begins
+                # right after env_obs at self.input_size. Keeping this in sync with
+                # network_input_size / the coupled splice makes the actor-usage
+                # saliency (the prereg's temporal-prediction-USE metric) measurable
+                # under latent-primary instead of hitting the NaN sentinel.
+                if getattr(self, 'gsp_actor_latent_primary', False):
+                    base = 0
+                else:
+                    base = int(self.input_size)  # raw env_obs width; pred starts here
                 in_dim = main_net.fc1.weight.shape[1]
                 if pred_width > 0 and base >= 0 and base + pred_width <= in_dim:
                     pred_slice = slice(base, base + pred_width)

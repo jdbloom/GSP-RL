@@ -21,7 +21,8 @@ from gsp_rl.src.networks import (
     TD3ActorNetwork,
     TD3CriticNetwork,
     EnvironmentEncoder,
-    AttentionEncoder
+    AttentionEncoder,
+    simnorm,
 )
 import torch as T
 import torch.nn as nn
@@ -513,6 +514,37 @@ class Hyperparameters:
         #     cosine latent loss (SPR: raw-MSE is the catastrophic variant).
         self.gsp_jepa_cosine_loss = bool(config.get('GSP_JEPA_COSINE_LOSS', False))
 
+        # --- Latent-primary actor head (2026-07-06 pre-registration) ---
+        # See docs/research/2026-07-06-latent-primary-actor-prereg.md (Stelaris).
+        # Both default OFF so an existing GSP_JEPA_ENABLED / coupled run is
+        # byte-identical (network dims, replay dims, config hash unchanged).
+        #
+        # (A) GSP_ACTOR_LATENT_PRIMARY — feed the actor's Q-net
+        #     [latent(enc_dim) | neighbor/global latents] and DROP the raw env-obs
+        #     block (Dreamer / TD-MPC2 style). The value gradient (already coupled
+        #     via GSP_JEPA_COUPLE_VALUE) then MUST route through the encoder,
+        #     forcing the policy to use the latent's moment-to-moment content
+        #     rather than solving from raw obs and treating the latent as an
+        #     optional side-feature (the frozen_mean-inert failure of the concat
+        #     design). Changes network_input_size (actor.py) — the runtime
+        #     augmented-obs builder (RL-CollectiveTransport make_agent_state) and
+        #     the coupled splice (learn_DDQN_jepa_coupled) drop env_obs in lockstep.
+        self.gsp_actor_latent_primary = bool(
+            config.get('GSP_ACTOR_LATENT_PRIMARY', False)
+        )
+        #
+        # (B) GSP_JEPA_SIMNORM — project the latent onto a per-group simplex
+        #     (DreamerV3 2301.04104 / TD-MPC2 2310.16828) before it enters the
+        #     Q-net AND before the self-prediction comparison. Applied inside
+        #     JEPAEncoder.forward so the online latent, the EMA-target latent, and
+        #     the host's choose_agent_gsp latent are all bounded/consistent via one
+        #     code path. Bounds the heterogeneous latent input and stabilizes the
+        #     coupled latent→value path.
+        self.gsp_jepa_simnorm = bool(config.get('GSP_JEPA_SIMNORM', False))
+        self.gsp_jepa_simnorm_group_size = int(
+            config.get('GSP_JEPA_SIMNORM_GROUP_SIZE', 8)
+        )
+
 class NetworkAids(Hyperparameters):
     """Network factory, learning algorithms, action selection, and memory management.
 
@@ -936,7 +968,14 @@ class NetworkAids(Hyperparameters):
 
         device = networks['q_eval'].device
         enc_dim = int(self.gsp_encoder_dim)
-        gsp_idx = self.input_size  # latent slot begins right after raw env obs
+        # Latent slot start index in the stored augmented state. Concat design:
+        # [env_obs | latent | (global)] → slot begins right after raw env obs.
+        # Latent-primary (GSP_ACTOR_LATENT_PRIMARY): env_obs is dropped from the
+        # actor's Q-net input, so the augmented state is [latent | (global)] and
+        # the slot begins at index 0. Must match network_input_size (actor.py) and
+        # make_agent_state (RL-CollectiveTransport) or the state_dict sizes / the
+        # splice would desync.
+        gsp_idx = 0 if getattr(self, 'gsp_actor_latent_primary', False) else self.input_size
 
         # The JEPA encoder/predictor default to their own device (cuda:0 or cpu),
         # which matches the Q-net in production (single CUDA device) but can differ
@@ -1003,6 +1042,14 @@ class NetworkAids(Hyperparameters):
             z_pred = self.gsp_predictor(z_t, a_onehot)
         else:
             z_pred = self.gsp_predictor(z_t)
+
+        # SimNorm consistency: z_t and z_target already live on the simplex (the
+        # encoder applies SimNorm inside forward). The predictor output does NOT,
+        # so project it onto the same simplex before the self-prediction MSE so
+        # both operands are comparable (target/online consistent). No-op when the
+        # flag is off.
+        if self.gsp_jepa_simnorm:
+            z_pred = simnorm(z_pred, self.gsp_jepa_simnorm_group_size)
 
         # Target latent from the EMA target encoder on the raw gsp_obs, detached.
         # (state_{t+k} is not co-indexed in the MAIN replay; the coupled step
@@ -1493,6 +1540,11 @@ class NetworkAids(Hyperparameters):
         # Forward through online encoder + predictor
         z_t = self.gsp_encoder_online(states)
         z_pred = self.gsp_predictor(z_t)
+        # SimNorm consistency: z_t/z_target already lie on the simplex (encoder
+        # applies SimNorm in forward); project the predictor output onto the same
+        # simplex so both operands of the self-prediction MSE match. No-op off.
+        if self.gsp_jepa_simnorm:
+            z_pred = simnorm(z_pred, self.gsp_jepa_simnorm_group_size)
 
         # Target: forward through frozen target encoder
         with T.no_grad():

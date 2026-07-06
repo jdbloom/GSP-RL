@@ -283,3 +283,211 @@ class TestSkipStandaloneSelfPredWhenCoupled:
         actor.learn_gsp_jepa = _rec
         actor.learn_gsp()
         assert called["n"] == 1, "standalone learn_gsp_jepa must run when not coupled"
+
+
+# ---------------------------------------------------------------------------
+# Latent-primary actor head (GSP_ACTOR_LATENT_PRIMARY) +
+# SimNorm (GSP_JEPA_SIMNORM) — 2026-07-06 pre-registration.
+# ---------------------------------------------------------------------------
+from gsp_rl.src.networks.jepa import simnorm, JEPAEncoder  # noqa: E402
+
+
+def fill_main_replay_primary(actor, n=BATCH * 2):
+    """Fill the main replay with augmented states of the actor's OWN Q-net input
+    width (network_input_size), whatever the flags set it to."""
+    aug_size = actor.network_input_size
+    for _ in range(n):
+        s = np.random.randn(aug_size).astype(np.float32)
+        s_ = np.random.randn(aug_size).astype(np.float32)
+        a = np.random.randint(0, NUM_ACTIONS)
+        gsp_obs = np.random.randn(GSP_INPUT).astype(np.float32)
+        actor.store_agent_transition(
+            s, a, 0.5, s_, False, gsp_obs=gsp_obs, gsp_label=np.zeros(1, np.float32)
+        )
+
+
+class TestLatentPrimaryInputDim:
+    """GSP_ACTOR_LATENT_PRIMARY drops the raw env-obs block from the Q-net input."""
+
+    def test_default_concat_input_dim(self):
+        """Flag OFF: Q-net input == env_obs + encoder_dim (unchanged legacy)."""
+        actor = make_actor()  # GSP_ACTOR_LATENT_PRIMARY defaults False
+        assert actor.gsp_actor_latent_primary is False
+        assert actor.network_input_size == ENV_OBS + ENC_DIM
+        # The Q-net's first Linear layer must match.
+        assert actor.networks["q_eval"].fc1.weight.shape[1] == ENV_OBS + ENC_DIM
+
+    def test_latent_primary_drops_env_obs(self):
+        """Flag ON: Q-net input == encoder_dim only (env_obs dropped)."""
+        actor = make_actor(GSP_ACTOR_LATENT_PRIMARY=True)
+        assert actor.gsp_actor_latent_primary is True
+        assert actor.network_input_size == ENC_DIM
+        assert actor.networks["q_eval"].fc1.weight.shape[1] == ENC_DIM
+
+    def test_latent_primary_coupled_learn_step_runs(self):
+        """Coupled learn step must run coherently under latent-primary: the
+        spliced state is [latent | (global)] with the latent slot at index 0,
+        so the augmented Q-forward matches network_input_size."""
+        actor = make_actor(
+            GSP_ACTOR_LATENT_PRIMARY=True, GSP_JEPA_COUPLE_VALUE=True
+        )
+        fill_main_replay_primary(actor)
+        result = actor.learn_DDQN_jepa_coupled(actor.networks, actor.gsp_networks)
+        assert result is not None and np.isfinite(result["ddqn_loss"])
+
+    def test_latent_primary_value_gradient_reaches_encoder(self):
+        """Latent-primary + coupling: the value loss MUST reach the encoder
+        (the whole point — the actor can only get env info via the latent)."""
+        actor = make_actor(
+            GSP_ACTOR_LATENT_PRIMARY=True, GSP_JEPA_COUPLE_VALUE=True
+        )
+        fill_main_replay_primary(actor)
+        for p in actor.gsp_encoder_online.parameters():
+            p.grad = None
+        actor.learn_DDQN_jepa_coupled(actor.networks, actor.gsp_networks)
+        grads = [
+            p.grad for p in actor.gsp_encoder_online.parameters() if p.grad is not None
+        ]
+        total = sum(g.abs().sum().item() for g in grads) if grads else 0.0
+        assert total > 0, "value loss did not reach encoder under latent-primary"
+
+    def test_latent_primary_diagnostics_do_not_crash(self):
+        """compute_diagnostics must run under latent-primary: the actor-usage
+        pred_slice base is 0 (env_obs dropped), so the slice stays in-bounds and
+        the diagnostic path does not raise (the NaN sentinel is acceptable when
+        the latent IS the whole input)."""
+        actor = make_actor(
+            GSP_ACTOR_LATENT_PRIMARY=True,
+            GSP_JEPA_COUPLE_VALUE=True,
+            DIAGNOSTICS_ENABLED=True,
+            DIAGNOSTICS_FREEZE_EPISODE=0,
+            DIAGNOSTICS_BATCH_SIZE=BATCH,
+        )
+        fill_main_replay_primary(actor)
+        actor.freeze_diagnostic_batch()
+        out = actor.compute_diagnostics()
+        assert isinstance(out, dict) and len(out) > 0
+
+
+class TestSimNormHelper:
+    """simnorm() projects each group onto the simplex."""
+
+    def test_groups_sum_to_one(self):
+        x = T.randn(5, 32)
+        y = simnorm(x, group_size=8)
+        assert y.shape == x.shape
+        groups = y.view(5, 4, 8)
+        sums = groups.sum(dim=-1)
+        assert T.allclose(sums, T.ones_like(sums), atol=1e-5)
+
+    def test_all_nonnegative(self):
+        y = simnorm(T.randn(3, 16), group_size=8)
+        assert (y >= 0).all()
+
+    def test_rejects_indivisible(self):
+        with pytest.raises(ValueError):
+            simnorm(T.randn(2, 10), group_size=8)  # 10 % 8 != 0
+
+    def test_handles_arbitrary_leading_dims(self):
+        y = simnorm(T.randn(2, 3, 16), group_size=8)
+        assert y.shape == (2, 3, 16)
+        assert T.allclose(
+            y.view(2, 3, 2, 8).sum(dim=-1), T.ones(2, 3, 2), atol=1e-5
+        )
+
+
+class TestSimNormEncoder:
+    """GSP_JEPA_SIMNORM makes the encoder output lie on the simplex."""
+
+    def test_encoder_output_on_simplex_when_on(self):
+        actor = make_actor(GSP_JEPA_SIMNORM=True)
+        assert actor.gsp_encoder_online.simnorm is True
+        # Target encoder (EMA deepcopy) must inherit the flag.
+        assert actor.gsp_encoder_target.simnorm is True
+        x = T.randn(BATCH, GSP_INPUT).to(actor.gsp_encoder_online.device)
+        with T.no_grad():
+            z = actor.gsp_encoder_online(x)
+        assert z.shape == (BATCH, ENC_DIM)
+        groups = z.view(BATCH, ENC_DIM // 8, 8)
+        assert T.allclose(
+            groups.sum(dim=-1), T.ones(BATCH, ENC_DIM // 8).to(z.device), atol=1e-5
+        )
+
+    def test_encoder_output_unbounded_when_off(self):
+        """Flag OFF: the encoder output is NOT on the simplex (raw linear)."""
+        actor = make_actor()  # SimNorm off
+        assert actor.gsp_encoder_online.simnorm is False
+        x = T.randn(BATCH, GSP_INPUT).to(actor.gsp_encoder_online.device)
+        with T.no_grad():
+            z = actor.gsp_encoder_online(x)
+        groups = z.view(BATCH, ENC_DIM // 8, 8)
+        sums = groups.sum(dim=-1)
+        assert not T.allclose(
+            sums, T.ones_like(sums), atol=1e-3
+        ), "raw encoder output should not already be on the simplex"
+
+    def test_simnorm_coupled_learn_step_runs(self):
+        actor = make_actor(GSP_JEPA_SIMNORM=True, GSP_JEPA_COUPLE_VALUE=True)
+        fill_main_replay(actor)
+        result = actor.learn_DDQN_jepa_coupled(actor.networks, actor.gsp_networks)
+        assert result is not None and np.isfinite(result["jepa_pred_mse"])
+
+    def test_simnorm_rejects_bad_group_size_at_build(self):
+        # ENC_DIM=8 is not divisible by group_size=3.
+        with pytest.raises(ValueError):
+            make_actor(GSP_JEPA_SIMNORM=True, GSP_JEPA_SIMNORM_GROUP_SIZE=3)
+
+
+class TestLatentPrimaryAndSimNormCompose:
+    """Both flags together: input dim dropped AND latent on simplex."""
+
+    def test_compose_dims_and_learn(self):
+        actor = make_actor(
+            GSP_ACTOR_LATENT_PRIMARY=True,
+            GSP_JEPA_SIMNORM=True,
+            GSP_JEPA_COUPLE_VALUE=True,
+        )
+        assert actor.network_input_size == ENC_DIM
+        assert actor.gsp_encoder_online.simnorm is True
+        fill_main_replay_primary(actor)
+        result = actor.learn_DDQN_jepa_coupled(actor.networks, actor.gsp_networks)
+        assert result is not None and np.isfinite(result["total_loss"])
+
+
+class TestNewFlagsOffByteIdentical:
+    """With the two new flags OFF, network dims, replay dims, and encoder
+    forward are byte-identical to a plain coupled build — cannot change legacy."""
+
+    def test_network_dims_unchanged_when_flags_off(self):
+        base = make_actor(GSP_JEPA_COUPLE_VALUE=True)
+        withflags = make_actor(
+            GSP_JEPA_COUPLE_VALUE=True,
+            GSP_ACTOR_LATENT_PRIMARY=False,
+            GSP_JEPA_SIMNORM=False,
+        )
+        assert base.network_input_size == withflags.network_input_size == ENV_OBS + ENC_DIM
+        assert (
+            base.networks["q_eval"].fc1.weight.shape
+            == withflags.networks["q_eval"].fc1.weight.shape
+        )
+        assert (
+            base.networks["replay"].gsp_obs_size
+            == withflags.networks["replay"].gsp_obs_size
+        )
+
+    def test_encoder_forward_identical_when_flags_off(self):
+        T.manual_seed(7)
+        np.random.seed(7)
+        a1 = make_actor(GSP_JEPA_COUPLE_VALUE=True)
+        T.manual_seed(7)
+        np.random.seed(7)
+        a2 = make_actor(
+            GSP_JEPA_COUPLE_VALUE=True,
+            GSP_ACTOR_LATENT_PRIMARY=False,
+            GSP_JEPA_SIMNORM=False,
+        )
+        x = T.randn(BATCH, GSP_INPUT).to(a1.gsp_encoder_online.device)
+        with T.no_grad():
+            z1 = a1.gsp_encoder_online(x)
+            z2 = a2.gsp_encoder_online(x.to(a2.gsp_encoder_online.device))
+        assert T.allclose(z1.cpu(), z2.cpu(), atol=0.0)
