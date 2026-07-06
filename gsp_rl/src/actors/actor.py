@@ -275,7 +275,18 @@ class Actor(NetworkAids):
                 'use_layer_norm': getattr(self, 'actor_use_layer_norm', False),
                 'critic_loss': getattr(self, 'critic_loss', 'mse'),
             }
-            self.networks = self.build_DDQN(nn_args)
+            # Successor-Features head (GSP_SF_ENABLED): swap the scalar-Q DDQN pair
+            # for the DDQN_SF pair (psi + learned reward-weight w), and allocate the
+            # replay's phi column so the per-step cumulant is stored. Default OFF —
+            # unset GSP_SF_ENABLED keeps the exact legacy DDQN build.
+            _sf = getattr(self, 'gsp_sf_enabled', False)
+            _phi_sz = 0
+            if _sf:
+                nn_args['d_phi'] = self.gsp_sf_phi_dim
+                _phi_sz = self.gsp_sf_phi_dim
+                self.networks = self.make_DDQN_SF_networks(nn_args)
+            else:
+                self.networks = self.build_DDQN(nn_args)
             self.networks['learning_scheme'] = 'DDQN'
             # gsp_obs is stored in the main replay for BOTH the legacy e2e path
             # and the coupled-JEPA path (GSP_JEPA_COUPLE_VALUE): both re-encode the
@@ -284,7 +295,7 @@ class Actor(NetworkAids):
                 self, 'gsp_jepa_couple_value', False
             )
             gsp_obs_sz = self.gsp_network_input if _needs_gsp_obs else 0
-            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, 1, 'Discrete', gsp_obs_size=gsp_obs_sz, recency_halflife=self.recency_halflife)
+            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, 1, 'Discrete', gsp_obs_size=gsp_obs_sz, recency_halflife=self.recency_halflife, phi_size=_phi_sz)
             self.networks['learn_step_counter'] = 0
         elif learning_scheme == 'DDPG':
             actor_nn_args = {
@@ -646,6 +657,20 @@ class Actor(NetworkAids):
                 return result.get('ddqn_loss')  # Main.py expects a scalar, not a dict
             return None
 
+        # Successor-Features path (GSP_SF_ENABLED): Q = psi . w, psi trained by its
+        # own TD loss and w by reward regression. Mutually exclusive with the
+        # coupled-JEPA / e2e paths above (both return before reaching here).
+        if (
+            self.networks['learning_scheme'] == 'DDQN'
+            and getattr(self, 'gsp_sf_enabled', False)
+        ):
+            self.replace_target_network()
+            result = self.learn_DDQN_sf(self.networks)
+            self.last_e2e_diagnostics = result
+            if result is not None:
+                return result.get('sf_psi_loss')
+            return None
+
         if self.networks['learning_scheme'] == 'DQN':
             self.replace_target_network()
 
@@ -718,8 +743,8 @@ class Actor(NetworkAids):
             else:
                 self.last_gsp_loss = float(loss)
 
-    def store_agent_transition(self, s, a, r, s_, d, gsp_obs=None, gsp_label=None):
-        self.store_transition(s, a, r, s_, d, self.networks, gsp_obs=gsp_obs, gsp_label=gsp_label)
+    def store_agent_transition(self, s, a, r, s_, d, gsp_obs=None, gsp_label=None, phi=None):
+        self.store_transition(s, a, r, s_, d, self.networks, gsp_obs=gsp_obs, gsp_label=gsp_label, phi=phi)
     
     def store_gsp_transition(self, s, a, r, s_, d):
         if self.attention_gsp:

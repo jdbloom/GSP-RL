@@ -14,6 +14,7 @@ See Also: docs/modules/actors.md, docs/algorithms.md
 from gsp_rl.src.networks import (
     DQN,
     DDQN,
+    DDQN_SF,
     DDPGActorNetwork,
     DDPGCriticNetwork,
     RDDPGActorNetwork,
@@ -284,6 +285,27 @@ class Hyperparameters:
         # not value-bootstrapping and do not exhibit the same divergence.)
         self._critic_loss_fn = (
             nn.SmoothL1Loss() if self.critic_loss == 'huber' else nn.MSELoss())
+
+        # --- Successor-Features value head (GSP_SF_ENABLED) -------------------
+        # Barreto 2017 (1606.05312): the DDQN Q-net predicts psi(s,a) in
+        # R^(n_actions x d_phi) — the discounted future sum of a low-dim cumulant
+        # phi — and Q(s,a) = psi(s,a) . w with w a learned reward-weight vector.
+        # The prediction psi *is* the value, so zeroing psi zeroes Q (causal by
+        # construction). Raw obs is KEPT as the net input. All default OFF — an
+        # unset GSP_SF_ENABLED reproduces the exact DDQN path byte-for-byte.
+        #   GSP_SF_ENABLED    : master switch (routes build + learn to the SF path).
+        #   GSP_SF_PHI_DIM     : d_phi, the cumulant width. Default 1 (fallback phi
+        #                       = [scalar reward]); the host passes a richer
+        #                       d_phi-dim phi per step via store_agent_transition.
+        #   GSP_SF_W_LR        : LR for the reward-weight w regression (default =
+        #                       the actor LR).
+        #   GSP_SF_W_TARGET    : 'reward' (default, one-step w.phi ~= r) or
+        #                       'reward_to_go' (regress Q=psi.w to the discounted
+        #                       bootstrap target — a value-scale-consistent readout).
+        self.gsp_sf_enabled = bool(config.get('GSP_SF_ENABLED', False))
+        self.gsp_sf_phi_dim = int(config.get('GSP_SF_PHI_DIM', 1))
+        self.gsp_sf_w_lr = float(config.get('GSP_SF_W_LR', self.lr))
+        self.gsp_sf_w_target = str(config.get('GSP_SF_W_TARGET', 'reward')).lower()
 
         self.gsp_e2e_enabled = bool(config.get('GSP_E2E_ENABLED', False))
         self.gsp_e2e_lambda = float(config.get('GSP_E2E_LAMBDA', 1.0))
@@ -600,7 +622,17 @@ class NetworkAids(Hyperparameters):
     
     def make_DDQN_networks(self, nn_args):
         return {'q_eval':DDQN(**nn_args), 'q_next':DDQN(**nn_args)}
-    
+
+    def make_DDQN_SF_networks(self, nn_args):
+        """Build the Successor-Features DDQN pair (GSP_SF_ENABLED).
+
+        Identical trunk to make_DDQN_networks; each net is a DDQN_SF that outputs
+        psi (n_actions x d_phi) and carries its own learned reward-weight w. nn_args
+        must include 'd_phi'. The reward weight w lives on q_eval and is trained by
+        reward regression; q_next.w is Polyak/hard-copied with the rest of q_next.
+        """
+        return {'q_eval': DDQN_SF(**nn_args), 'q_next': DDQN_SF(**nn_args)}
+
     def make_DDPG_networks(self, actor_nn_args, critic_nn_args):
         DDPG_networks = {
                         'actor': DDPGActorNetwork(**actor_nn_args, name = 'actor'),
@@ -800,6 +832,117 @@ class NetworkAids(Hyperparameters):
         self.decrement_epsilon()
 
         return loss.item()
+
+    def learn_DDQN_sf(self, networks):
+        """Successor-Features DDQN learn step (GSP_SF_ENABLED).
+
+        Two decoupled updates on the SF-DDQN pair (q_eval = DDQN_SF, q_next its
+        target):
+
+        1. psi TD update (the value computation itself):
+             target_psi = phi_t + gamma * psi_next(s', a*)       (a* = argmax_a Q)
+             loss_psi   = critic_loss( psi_eval(s_t, a_t), target_psi.detach() )
+           applied per cumulant component (broadcast MSE/Huber over d_phi). The
+           double-Q decoupling matches learn_DDQN: q_eval selects a*, q_next
+           evaluates psi_next(s', a*). Because Q = psi . w, this trains the exact
+           quantity that *is* the value — zeroing psi zeroes Q by construction.
+
+        2. w reward-regression update (sets the value scale):
+             pred_r = psi_eval(s_t, a_t).detach() . w
+             loss_w = critic_loss( pred_r, r_target )
+           r_target is the (reward-scaled) scalar reward (default) or the
+           discounted-bootstrap reward-to-go (GSP_SF_W_TARGET='reward_to_go'). psi
+           is detached here so the reward regression only moves w — it never
+           perturbs the psi feature trunk, keeping the two objectives orthogonal.
+
+        Stability: the same critic stabilizers as learn_DDQN apply to the Q=psi.w
+        scale — reward_scale multiplies phi in the psi target AND the w target;
+        q_target_clip bounds the psi bootstrap target; grad_clip_norm clips the psi
+        trunk; critic_loss (huber) caps the per-sample gradient. w is init 1/d_phi
+        so the initial Q is a bounded mean of psi's components.
+
+        Returns:
+            dict of diagnostics: sf_psi_loss, sf_w_loss, sf_psi_norm, sf_w_norm,
+                sf_q_mean, sf_q_abs_max, w (list). None if the batch is unavailable.
+        """
+        q_eval = networks['q_eval']
+        q_next = networks['q_next']
+        device = q_eval.device
+
+        result = networks['replay'].sample_buffer_sf(self.batch_size)
+        states_np, actions_np, rewards_np, states_np_, dones_np, phi_np = result
+
+        states = T.as_tensor(states_np, dtype=T.float32).to(device)
+        actions = T.as_tensor(np.asarray(actions_np, dtype=np.float32)).to(device)
+        rewards = T.as_tensor(rewards_np, dtype=T.float32).to(device)
+        states_ = T.as_tensor(states_np_, dtype=T.float32).to(device)
+        dones = T.as_tensor(dones_np).to(device)
+        phi = T.as_tensor(phi_np, dtype=T.float32).to(device)  # (batch, d_phi)
+
+        indices = T.arange(self.batch_size, device=device)
+        act_idx = actions.long()
+
+        # --- 1. psi TD update -------------------------------------------------
+        q_eval.psi_optimizer.zero_grad()
+
+        psi_all = q_eval.psi(states)                     # (batch, n_act, d_phi)
+        psi_pred = psi_all[indices, act_idx]             # (batch, d_phi)
+
+        with T.no_grad():
+            # Double-Q: a* from q_eval, psi evaluated on q_next.
+            q_eval_next = q_eval.forward(states_)        # (batch, n_act)
+            max_actions = T.argmax(q_eval_next, dim=1)
+            psi_next_all = q_next.psi(states_)           # (batch, n_act, d_phi)
+            psi_next = psi_next_all[indices, max_actions]  # (batch, d_phi)
+            psi_next[dones] = 0.0
+            # reward_scale multiplies the immediate cumulant, mirroring _q_target.
+            phi_scaled = phi if self.reward_scale == 1.0 else self.reward_scale * phi
+            psi_target = phi_scaled + self.gamma * psi_next
+            if self.q_target_clip > 0:
+                psi_target = T.clamp(psi_target, -self.q_target_clip, self.q_target_clip)
+
+        psi_loss = self._critic_loss_fn(psi_pred, psi_target)
+        psi_loss.backward()
+        _check_nan(psi_loss, f"SF psi loss at step {networks['learn_step_counter']}")
+        self._clip_critic_grad(q_eval)
+        q_eval.psi_optimizer.step()
+
+        # --- 2. w reward-regression update ------------------------------------
+        q_eval.w_optimizer.zero_grad()
+
+        psi_detached = psi_pred.detach()                 # (batch, d_phi)
+        pred_r = T.matmul(psi_detached, q_eval.w)        # (batch,)
+        if self.gsp_sf_w_target == 'reward_to_go':
+            # Regress Q = psi.w to the discounted-bootstrap target (value scale).
+            with T.no_grad():
+                q_next_boot = q_next.forward(states_)[indices, max_actions]
+                q_next_boot = q_next_boot.clone()
+                q_next_boot[dones] = 0.0
+                r_target = self._q_target(rewards, q_next_boot)
+        else:
+            # Default: one-step w.phi ~= r (reward_scale-consistent with the target).
+            r_target = rewards if self.reward_scale == 1.0 else self.reward_scale * rewards
+        w_loss = self._critic_loss_fn(pred_r, r_target)
+        w_loss.backward()
+        _check_nan(w_loss, f"SF w loss at step {networks['learn_step_counter']}")
+        q_eval.w_optimizer.step()
+
+        networks['learn_step_counter'] += 1
+        self._maybe_redo(q_eval, states, networks['learn_step_counter'])
+        self.decrement_epsilon()
+
+        with T.no_grad():
+            q_now = T.matmul(psi_pred.detach(), q_eval.w)
+            diagnostics = {
+                'sf_psi_loss': float(psi_loss.item()),
+                'sf_w_loss': float(w_loss.item()),
+                'sf_psi_norm': float(psi_pred.detach().norm(dim=1).mean().item()),
+                'sf_w_norm': float(q_eval.w.detach().norm().item()),
+                'sf_q_mean': float(q_now.mean().item()),
+                'sf_q_abs_max': float(q_now.abs().max().item()),
+                'w': [float(v) for v in q_eval.w.detach().cpu().numpy()],
+            }
+        return diagnostics
 
     def learn_DDQN_e2e(self, networks, gsp_networks):
         """End-to-end joint training of DDQN + GSP head.
@@ -1595,8 +1738,15 @@ class NetworkAids(Hyperparameters):
     def decrement_epsilon(self):
         self.epsilon = max(self.epsilon-self.eps_dec, self.eps_min)
 
-    def store_transition(self, s, a, r, s_, d, networks, gsp_obs=None, gsp_label=None):
-        networks['replay'].store_transition(s, a, r, s_, d, gsp_obs=gsp_obs, gsp_label=gsp_label)
+    def store_transition(self, s, a, r, s_, d, networks, gsp_obs=None, gsp_label=None, phi=None):
+        # Only forward phi when set (SF path). The SequenceReplayBuffer / attention
+        # buffers used by RDDPG/GSP do not accept a phi kwarg, so passing it
+        # unconditionally would break every non-SF store. Keeps the legacy call
+        # signature byte-identical when GSP_SF_ENABLED is off.
+        if phi is None:
+            networks['replay'].store_transition(s, a, r, s_, d, gsp_obs=gsp_obs, gsp_label=gsp_label)
+        else:
+            networks['replay'].store_transition(s, a, r, s_, d, gsp_obs=gsp_obs, gsp_label=gsp_label, phi=phi)
     
     def store_attention_transition(self, s, y, networks):
         networks['replay'].store_transition(s, y)

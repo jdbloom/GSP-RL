@@ -20,6 +20,7 @@ def get_device(recurrent: bool = False) -> T.device:
 
 from .dqn import DQN
 from .ddqn import DDQN
+from .ddqn_sf import DDQN_SF
 from .ddpg import DDPGActorNetwork, DDPGCriticNetwork
 from .rddpg import RDDPGActorNetwork, RDDPGCriticNetwork
 from .td3 import TD3ActorNetwork, TD3CriticNetwork
