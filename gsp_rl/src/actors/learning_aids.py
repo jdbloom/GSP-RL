@@ -96,6 +96,34 @@ def vicreg_covariance_loss(h: T.Tensor) -> T.Tensor:
     return (off_diag ** 2).sum() / D
 
 
+def jepa_cosine_loss(pred: T.Tensor, target: T.Tensor, eps: float = 1e-8) -> T.Tensor:
+    """Normalized / cosine latent loss for the JEPA predictor (flag GSP_JEPA_COSINE_LOSS).
+
+    Replaces raw ``F.mse_loss`` between the predicted future latent and the
+    (detached) EMA-target latent. SPR (Schwarzer et al. 2007.05929, Table/ablation)
+    found the raw-MSE variant catastrophic (0.040) versus the normalized-cosine
+    variant (0.415): projecting both latents onto the unit sphere makes the loss
+    scale-invariant, so the objective can no longer be trivially minimized by
+    shrinking the latent norm (a collapse mode).
+
+    Computes, per sample, ``1 - cos(pred, target)`` (in ``[0, 2]``) and averages
+    over the batch. Zero iff the projected prediction points in the same
+    direction as the target; 2 iff exactly opposite.
+
+    Args:
+        pred:   Predicted future latent, shape (batch, D).
+        target: Target latent (detached), shape (batch, D).
+        eps:    Numerical floor for the L2 normalization.
+
+    Returns:
+        Scalar tensor loss in [0, 2].
+    """
+    pred_n = F.normalize(pred, dim=-1, eps=eps)
+    target_n = F.normalize(target, dim=-1, eps=eps)
+    cos = (pred_n * target_n).sum(dim=-1)
+    return (1.0 - cos).mean()
+
+
 def gsp_l2er_loss(actor_net, states: T.Tensor, eps: float = 1e-8) -> T.Tensor:
     """Compute the differentiable effective-rank regularization loss for the GSP head.
 
@@ -439,6 +467,51 @@ class Hyperparameters:
         self.gsp_jepa_enabled = bool(config.get('GSP_JEPA_ENABLED', False))
         self.gsp_encoder_dim = int(config.get('GSP_ENCODER_DIM', 32))
         self.gsp_encoder_ema_tau = float(config.get('GSP_ENCODER_EMA_TAU', 0.995))
+
+        # --- Coupled-JEPA levers (2026-07-05 literature-convergent fix) ---
+        # All default OFF so an existing GSP_JEPA_ENABLED run is byte-identical.
+        # See docs/research/2026-07-05-literature-synthesis-causal-prediction.md.
+        #
+        # (1) GSP_JEPA_COUPLE_VALUE — let the DDQN value-loss gradient flow into
+        #     gsp_encoder_online (mirrors the learn_DDQN_e2e coupling). This is the
+        #     core "make the latent decision-relevant" change (Ni et al. 2401.08898
+        #     Thm 2: self-prediction ZP + value together induce reward-predictive
+        #     representations; ZP alone stays decision-irrelevant). Requires the
+        #     DDQN e2e replay path (gsp_obs stored) so the encoder can be re-run
+        #     WITH gradient inside the actor learn step.
+        self.gsp_jepa_couple_value = bool(config.get('GSP_JEPA_COUPLE_VALUE', False))
+        #
+        # (1b) GSP_JEPA_VALUE_STOPGRAD_ACTOR — the explicit resolution of the
+        #     Ni-couple (#1) vs Dreamer-freeze (freeze world-model while updating
+        #     the actor) tension. DDQN has NO separate actor: the Q-net is both the
+        #     value function AND the policy (argmax_a Q). So "value-representation"
+        #     and "actor-input" are literally the same spliced latent tensor.
+        #     - False (default for the coupling arm): the value-loss gradient flows
+        #       FULLY into gsp_encoder_online (pure Ni coupling).
+        #     - True: the spliced latent is detached before entering the Q-net, so
+        #       the encoder is shaped ONLY by its self-prediction loss (pure
+        #       Dreamer-freeze) while the value head still consumes the latent.
+        #     Exposed as a flag rather than silently picked — see the PR body.
+        self.gsp_jepa_value_stopgrad_actor = bool(
+            config.get('GSP_JEPA_VALUE_STOPGRAD_ACTOR', False)
+        )
+        # Weight on the DDQN value-loss contribution to the encoder when coupled.
+        # Reuses the e2e lambda semantics; default 1.0 = plain sum.
+        self.gsp_jepa_value_coef = float(config.get('GSP_JEPA_VALUE_COEF', 1.0))
+        # Weight on the JEPA self-prediction (latent) loss inside the coupled step.
+        # Default 1.0. Set to 0.0 to isolate the value path (used to verify the
+        # Dreamer-freeze stop-grad blocks the value gradient to the encoder).
+        self.gsp_jepa_selfpred_coef = float(config.get('GSP_JEPA_SELFPRED_COEF', 1.0))
+        #
+        # (2) GSP_JEPA_ACTION_COND — action-condition the predictor
+        #     JEPAPredictor(z_t, a_t) → ẑ_{t+k} (SPR 2007.05929). Needs the action
+        #     width; read from GSP_JEPA_ACTION_DIM (0 = legacy z-only predictor).
+        self.gsp_jepa_action_cond = bool(config.get('GSP_JEPA_ACTION_COND', False))
+        self.gsp_jepa_action_dim = int(config.get('GSP_JEPA_ACTION_DIM', 0))
+        #
+        # (3) GSP_JEPA_COSINE_LOSS — swap the raw latent MSE for the normalized /
+        #     cosine latent loss (SPR: raw-MSE is the catastrophic variant).
+        self.gsp_jepa_cosine_loss = bool(config.get('GSP_JEPA_COSINE_LOSS', False))
 
 class NetworkAids(Hyperparameters):
     """Network factory, learning algorithms, action selection, and memory management.
@@ -825,6 +898,192 @@ class NetworkAids(Hyperparameters):
             'gsp_label_mean': float(gsp_labels.detach().mean().item()),
             'gsp_label_std': float(gsp_labels.detach().std().item()),
         }
+
+    def learn_DDQN_jepa_coupled(self, networks, gsp_networks):
+        """Coupled-JEPA DDQN learn step (GSP_JEPA_COUPLE_VALUE).
+
+        The literature-convergent fix for the causally-inert GSP prediction
+        (docs/research/2026-07-05-literature-synthesis-causal-prediction.md).
+        Structurally mirrors ``learn_DDQN_e2e`` but operates on the JEPA *latent*
+        slot instead of a scalar Δθ prediction, and adds the JEPA self-prediction
+        (latent) loss so the encoder is shaped by BOTH signals:
+
+          * value path:  the DDQN TD loss gradient flows into gsp_encoder_online
+            because we re-encode the stored raw gsp_obs WITH gradient and splice
+            the FRESH latent into the augmented state before the Q-forward
+            (Ni et al. 2401.08898 Thm 2 — value + self-prediction ⇒ reward-
+            predictive; ZP alone stays decision-irrelevant).
+          * self-prediction path: predictor(z_t[, a_t]) vs EMA-target(z_{t+k}),
+            with stop-grad on the target encoder (the standard JEPA collapse
+            guard). This term is the same objective as learn_gsp_jepa; here it is
+            trained jointly with the value loss on the SAME encoder.
+
+        Ni-couple vs Dreamer-freeze resolution (GSP_JEPA_VALUE_STOPGRAD_ACTOR):
+        DDQN has no separate actor — the Q-net is value AND policy — so the
+        spliced latent is simultaneously the value representation and the
+        actor input. When the flag is True the spliced latent is detached before
+        the Q-net, so the value loss cannot rewrite the encoder (pure Dreamer-
+        freeze; encoder shaped only by self-prediction). When False (default for
+        the coupling arm) the value gradient flows fully into the encoder.
+
+        Requires the main replay to carry gsp_obs (built when GSP_JEPA_COUPLE_VALUE
+        is set). Returns a diagnostics dict including latent_rank / latent_var /
+        jepa_pred_mse so the same metrics the uncoupled path logs are available,
+        plus the value-loss / total-loss / grad-norm terms.
+        """
+        if networks['replay'].mem_ctr < self.batch_size:
+            return None
+
+        device = networks['q_eval'].device
+        enc_dim = int(self.gsp_encoder_dim)
+        gsp_idx = self.input_size  # latent slot begins right after raw env obs
+
+        # The JEPA encoder/predictor default to their own device (cuda:0 or cpu),
+        # which matches the Q-net in production (single CUDA device) but can differ
+        # on MPS/multi-device hosts. Co-locate them with the Q-net so the spliced
+        # latent, the Q-forward, and the self-prediction loss all share one device.
+        if getattr(self.gsp_encoder_online, 'device', device) != device:
+            self.gsp_encoder_online.to(device)
+            self.gsp_encoder_online.device = device
+            self.gsp_encoder_target.to(device)
+            self.gsp_encoder_target.device = device
+            self.gsp_predictor.to(device)
+            self.gsp_predictor.device = device
+        value_coef = self.gsp_jepa_value_coef
+        selfpred_coef = self.gsp_jepa_selfpred_coef
+        stopgrad_actor = self.gsp_jepa_value_stopgrad_actor
+
+        # --- 1. Sample 7-value batch from main replay ---
+        result = networks['replay'].sample_buffer(self.batch_size)
+        states_np, actions_np, rewards_np, states_np_, dones_np, gsp_obs_np, _ = result
+        states = T.as_tensor(states_np, dtype=T.float32).to(device)
+        actions = T.as_tensor(np.asarray(actions_np, dtype=np.float32)).to(device)
+        rewards = T.as_tensor(rewards_np, dtype=T.float32).to(device)
+        states_ = T.as_tensor(states_np_, dtype=T.float32).to(device)
+        dones = T.as_tensor(dones_np).to(device)
+        gsp_obs = T.as_tensor(gsp_obs_np, dtype=T.float32).to(device)
+
+        networks['q_eval'].optimizer.zero_grad()
+        self._jepa_online_optimizer.zero_grad()
+
+        # --- 2. Re-encode raw gsp_obs WITH gradient → fresh latent ---
+        z_t = self.gsp_encoder_online(gsp_obs)  # (batch, enc_dim), grad-tracked
+
+        # --- 3. Splice the fresh latent into the augmented state ---
+        # Stop-grad the latent when used as the actor/Q-net INPUT if the
+        # Dreamer-freeze resolution is selected; otherwise the value gradient
+        # flows through into the encoder (Ni coupling).
+        latent_for_value = z_t.detach() if stopgrad_actor else z_t
+        augmented = T.cat(
+            [states[:, :gsp_idx], latent_for_value, states[:, gsp_idx + enc_dim:]],
+            dim=1,
+        )
+
+        # --- 4. DDQN forward on augmented state ---
+        indices = T.LongTensor(np.arange(self.batch_size).astype(np.int64))
+        q_pred = networks['q_eval'](augmented)[indices, actions.type(T.LongTensor)]
+
+        # --- 5. Stable Q-target from stored next-state (no encoder re-run) ---
+        with T.no_grad():
+            q_next = networks['q_next'](states_)
+            q_eval_next = networks['q_eval'](states_)
+            max_actions = T.argmax(q_eval_next, dim=1)
+            q_next[dones] = 0.0
+            bootstrap = q_next[indices, max_actions]
+            q_target = self._q_target(rewards, bootstrap)
+
+        ddqn_loss = self._critic_loss_fn(q_target, q_pred).to(device)
+
+        # --- 6. JEPA self-prediction loss (couples z_t to its own future) ---
+        if self.gsp_jepa_action_cond and self.gsp_predictor.action_dim > 0:
+            # One-hot the discrete DDQN action to the configured action width.
+            a_dim = self.gsp_predictor.action_dim
+            a_idx = actions.type(T.LongTensor).to(device)
+            a_onehot = F.one_hot(a_idx.clamp(0, a_dim - 1), num_classes=a_dim).float()
+            z_pred = self.gsp_predictor(z_t, a_onehot)
+        else:
+            z_pred = self.gsp_predictor(z_t)
+
+        # Target latent from the EMA target encoder on the raw gsp_obs, detached.
+        # (state_{t+k} is not co-indexed in the MAIN replay; the coupled step
+        # trains the predictor as a same-input consistency objective against the
+        # slow target encoder — the self-prediction collapse guard — while the
+        # value path provides the decision-relevance. The dedicated (t, t+k)
+        # temporal prediction continues in learn_gsp_jepa on the JEPA replay.)
+        with T.no_grad():
+            z_target = self.gsp_encoder_target(gsp_obs)
+
+        if self.gsp_jepa_cosine_loss:
+            loss_selfpred = jepa_cosine_loss(z_pred, z_target)
+        else:
+            loss_selfpred = F.mse_loss(z_pred, z_target)
+
+        # --- Optional VICReg anti-collapse on the online latent ---
+        vicreg_term = T.zeros((), device=z_t.device)
+        if self.gsp_vicreg_enabled:
+            vicreg_term = (
+                self.gsp_vicreg_var_coef * vicreg_variance_loss(z_t, target_std=1.0)
+                + self.gsp_vicreg_cov_coef * vicreg_covariance_loss(z_t)
+            )
+
+        total_loss = (
+            value_coef * ddqn_loss
+            + selfpred_coef * loss_selfpred
+            + vicreg_term
+        )
+
+        # --- 7. Joint backward + optimizer steps ---
+        total_loss.backward()
+        _check_nan(total_loss, f"coupled-JEPA loss at step {networks['learn_step_counter']}")
+
+        enc_params = list(self.gsp_encoder_online.parameters())
+        enc_grad_norm = float(
+            T.norm(T.stack([p.grad.norm() for p in enc_params if p.grad is not None]))
+        ) if any(p.grad is not None for p in enc_params) else 0.0
+        if self.grad_clip_norm > 0:
+            T.nn.utils.clip_grad_norm_(
+                list(self.gsp_encoder_online.parameters())
+                + list(self.gsp_predictor.parameters()),
+                max_norm=self.grad_clip_norm,
+            )
+            T.nn.utils.clip_grad_norm_(
+                networks['q_eval'].parameters(), max_norm=self.grad_clip_norm
+            )
+
+        networks['q_eval'].optimizer.step()
+        self._jepa_online_optimizer.step()
+
+        # --- 8. EMA update of the target encoder ---
+        self._update_jepa_target_encoder(self.gsp_encoder_ema_tau)
+
+        networks['learn_step_counter'] += 1
+        self.decrement_epsilon()
+
+        # --- 9. Latent diagnostics (mirror learn_gsp_jepa) ---
+        with T.no_grad():
+            latent_var = float(z_t.var(dim=0).mean().item())
+            z_cpu = z_t.detach().cpu()
+            try:
+                sv = T.linalg.svdvals(z_cpu)
+                latent_rank = float((sv > sv[0] * 0.01).sum().item())
+            except Exception:
+                latent_rank = float("nan")
+
+        stats = {
+            'ddqn_loss': float(ddqn_loss.item()),
+            'jepa_pred_mse': float(loss_selfpred.item()),
+            'total_loss': float(total_loss.item()),
+            'latent_var': latent_var,
+            'latent_rank': latent_rank,
+            'encoder_grad_norm': enc_grad_norm,
+        }
+        # Surface stats to Main.py's JEPA recorder in the same shape it expects.
+        self.last_gsp_jepa_stats = {
+            'var': latent_var,
+            'rank': latent_rank,
+            'pred_mse': float(loss_selfpred.item()),
+        }
+        return stats
 
     def learn_DDPG(self, networks, gsp = False, recurrent = False):
         states, actions, rewards, states_, dones = self.sample_memory(networks)
