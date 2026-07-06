@@ -250,3 +250,36 @@ class TestFlagsOffByteIdentical:
         a = make_actor()  # flags off
         # Legacy predictor: fc1 input == encoder_dim (no action concat).
         assert a.gsp_predictor.fc1.weight.shape[1] == ENC_DIM
+
+
+class TestSkipStandaloneSelfPredWhenCoupled:
+    """Under value-coupling, learn_gsp() must NOT also run the standalone
+    learn_gsp_jepa: the coupled step (learn_DDQN_jepa_coupled) already trains the
+    encoder's self-prediction, and the standalone path crashes under action-
+    conditioning (its buffer stores no action). Regression for the ep-0 crash
+    'JEPAPredictor built with action_dim > 0 requires an action tensor'."""
+
+    def test_learn_gsp_skips_standalone_when_coupled(self):
+        actor = make_actor(
+            GSP_JEPA_COUPLE_VALUE=True,
+            GSP_JEPA_ACTION_COND=True,
+            GSP_JEPA_ACTION_DIM=NUM_ACTIONS,
+        )
+        actor.gsp_networks["replay"].mem_ctr = BATCH * 2  # pass the buffer guard
+        called = {"n": 0}
+        actor.learn_gsp_jepa = lambda *a, **k: called.__setitem__("n", called["n"] + 1)
+        actor.learn_gsp()
+        assert called["n"] == 0, "standalone learn_gsp_jepa must be skipped when coupled"
+
+    def test_learn_gsp_runs_standalone_when_not_coupled(self):
+        actor = make_actor(GSP_JEPA_COUPLE_VALUE=False)
+        actor.gsp_networks["replay"].mem_ctr = BATCH * 2
+        called = {"n": 0}
+
+        def _rec(*a, **k):
+            called["n"] += 1
+            return None
+
+        actor.learn_gsp_jepa = _rec
+        actor.learn_gsp()
+        assert called["n"] == 1, "standalone learn_gsp_jepa must run when not coupled"
