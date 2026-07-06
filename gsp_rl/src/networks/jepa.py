@@ -23,6 +23,44 @@ See: docs/superpowers/specs/2026-04-16-jepa-mvp.md for the design rationale.
 """
 import torch as T
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+def simnorm(x: T.Tensor, group_size: int = 8) -> T.Tensor:
+    """Simplicial normalization (DreamerV3 / TD-MPC2).
+
+    Reshapes the trailing latent dimension into contiguous groups of
+    ``group_size`` and applies a softmax within each group, projecting every
+    group onto the probability simplex (each group sums to 1, all entries in
+    [0, 1]). This bounds and regularizes an otherwise unbounded latent so it can
+    be fed as a stable input to the actor's Q-net (and compared consistently in
+    the JEPA self-prediction loss).
+
+    Reference: Hafner et al. DreamerV3 (2301.04104) — "simlog"/simplical latent;
+    Hansen et al. TD-MPC2 (2310.16828) §3 SimNorm.
+
+    Args:
+        x: Tensor of shape ``(..., latent_dim)``. ``latent_dim`` MUST be an exact
+            multiple of ``group_size``.
+        group_size: Number of elements per simplex group. Default 8 (TD-MPC2).
+
+    Returns:
+        Tensor of the same shape as ``x``, with each contiguous group of
+        ``group_size`` entries lying on the simplex (summing to 1).
+    """
+    if group_size <= 0:
+        raise ValueError(f"simnorm group_size must be positive, got {group_size}")
+    latent_dim = x.shape[-1]
+    if latent_dim % group_size != 0:
+        raise ValueError(
+            f"simnorm: latent_dim ({latent_dim}) must be divisible by "
+            f"group_size ({group_size})."
+        )
+    lead_shape = x.shape[:-1]
+    n_groups = latent_dim // group_size
+    x = x.view(*lead_shape, n_groups, group_size)
+    x = F.softmax(x, dim=-1)
+    return x.reshape(*lead_shape, latent_dim)
 
 
 class JEPAEncoder(nn.Module):
@@ -35,18 +73,42 @@ class JEPAEncoder(nn.Module):
     This preserves gradient flow into the latent space and lets VICReg
     variance/covariance regularization operate on unbounded representations.
 
+    SimNorm (flag ``GSP_JEPA_SIMNORM``, DreamerV3 / TD-MPC2): when ``simnorm=True``
+    the final latent is projected onto a per-group simplex before it leaves the
+    encoder. Because the target encoder is an EMA *copy of this class* and the
+    host env's ``choose_agent_gsp`` calls this same ``forward``, applying SimNorm
+    here keeps the online latent, the EMA-target latent, and the runtime
+    augmented-obs latent byte-consistent with a single code path. ``simnorm=False``
+    (default) is bit-identical to the legacy encoder.
+
     Args:
         input_dim:  Dimensionality of the GSP head input (gsp_network_input).
         latent_dim: Output latent dimensionality. Default 32 (GSP_ENCODER_DIM).
         hidden:     Hidden layer width. Default 128.
+        simnorm:    Apply SimNorm to the latent. Default False (legacy).
+        simnorm_group_size: Group size for SimNorm. Default 8.
     """
 
-    def __init__(self, input_dim: int, latent_dim: int = 32, hidden: int = 128):
+    def __init__(
+        self,
+        input_dim: int,
+        latent_dim: int = 32,
+        hidden: int = 128,
+        simnorm: bool = False,
+        simnorm_group_size: int = 8,
+    ):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, hidden)
         self.ln1 = nn.LayerNorm(hidden)
         self.relu = nn.ReLU()
         self.fc2 = nn.Linear(hidden, latent_dim)
+        self.simnorm = bool(simnorm)
+        self.simnorm_group_size = int(simnorm_group_size)
+        if self.simnorm and latent_dim % self.simnorm_group_size != 0:
+            raise ValueError(
+                f"GSP_JEPA_SIMNORM: GSP_ENCODER_DIM ({latent_dim}) must be "
+                f"divisible by simnorm group_size ({self.simnorm_group_size})."
+            )
 
         # Determine device from environment (mirrors existing network convention)
         self.device = T.device("cuda:0" if T.cuda.is_available() else "cpu")
@@ -59,10 +121,15 @@ class JEPAEncoder(nn.Module):
             x: Input tensor of shape (batch, input_dim).
 
         Returns:
-            Latent tensor of shape (batch, latent_dim).
+            Latent tensor of shape (batch, latent_dim). When ``simnorm`` is set,
+            each contiguous group of ``simnorm_group_size`` entries lies on the
+            simplex.
         """
         h = self.relu(self.ln1(self.fc1(x)))
-        return self.fc2(h)
+        z = self.fc2(h)
+        if self.simnorm:
+            z = simnorm(z, self.simnorm_group_size)
+        return z
 
 
 class JEPAPredictor(nn.Module):
