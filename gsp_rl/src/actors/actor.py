@@ -172,7 +172,14 @@ class Actor(NetworkAids):
                 self.gsp_encoder_target = copy.deepcopy(self.gsp_encoder_online)
                 for param in self.gsp_encoder_target.parameters():
                     param.requires_grad = False
-                self.gsp_predictor = JEPAPredictor(latent_dim=_enc_dim)
+                # Action-condition the predictor when GSP_JEPA_ACTION_COND is set.
+                # action_dim=0 (default) yields the byte-identical legacy predictor.
+                _pred_action_dim = 0
+                if getattr(self, 'gsp_jepa_action_cond', False):
+                    _pred_action_dim = int(getattr(self, 'gsp_jepa_action_dim', 0))
+                self.gsp_predictor = JEPAPredictor(
+                    latent_dim=_enc_dim, action_dim=_pred_action_dim
+                )
                 # Optimizers: online encoder + predictor share one optimizer
                 self._jepa_online_optimizer = T.optim.Adam(
                     list(self.gsp_encoder_online.parameters())
@@ -237,7 +244,13 @@ class Actor(NetworkAids):
             }
             self.networks = self.build_DQN(nn_args)
             self.networks['learning_scheme'] = 'DQN'
-            gsp_obs_sz = self.gsp_network_input if self.gsp_e2e_enabled else 0
+            # gsp_obs is stored in the main replay for BOTH the legacy e2e path
+            # and the coupled-JEPA path (GSP_JEPA_COUPLE_VALUE): both re-encode the
+            # raw GSP input WITH gradient inside the actor learn step.
+            _needs_gsp_obs = self.gsp_e2e_enabled or getattr(
+                self, 'gsp_jepa_couple_value', False
+            )
+            gsp_obs_sz = self.gsp_network_input if _needs_gsp_obs else 0
             self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, 1, 'Discrete', gsp_obs_size=gsp_obs_sz, recency_halflife=self.recency_halflife)
             self.networks['learn_step_counter'] = 0
         elif learning_scheme == 'DDQN':
@@ -251,7 +264,13 @@ class Actor(NetworkAids):
             }
             self.networks = self.build_DDQN(nn_args)
             self.networks['learning_scheme'] = 'DDQN'
-            gsp_obs_sz = self.gsp_network_input if self.gsp_e2e_enabled else 0
+            # gsp_obs is stored in the main replay for BOTH the legacy e2e path
+            # and the coupled-JEPA path (GSP_JEPA_COUPLE_VALUE): both re-encode the
+            # raw GSP input WITH gradient inside the actor learn step.
+            _needs_gsp_obs = self.gsp_e2e_enabled or getattr(
+                self, 'gsp_jepa_couple_value', False
+            )
+            gsp_obs_sz = self.gsp_network_input if _needs_gsp_obs else 0
             self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, 1, 'Discrete', gsp_obs_size=gsp_obs_sz, recency_halflife=self.recency_halflife)
             self.networks['learn_step_counter'] = 0
         elif learning_scheme == 'DDPG':
@@ -586,6 +605,24 @@ class Actor(NetworkAids):
                 if self.networks['learn_step_counter'] % self.gsp_learning_offset == 0:
                     #print('[DEBUG] Learning Attention', self.networks['learn_step_counter'])
                     self.learn_gsp()
+
+        # Coupled-JEPA path (GSP_JEPA_COUPLE_VALUE): re-encode gsp_obs WITH
+        # gradient, splice the fresh latent into the augmented state, and train
+        # the encoder jointly on the DDQN value loss + JEPA self-prediction loss.
+        # Takes precedence over the scalar e2e path when JEPA is enabled.
+        if (
+            self.networks['learning_scheme'] == 'DDQN'
+            and self.gsp
+            and getattr(self, 'gsp_jepa_enabled', False)
+            and getattr(self, 'gsp_jepa_couple_value', False)
+        ):
+            self.replace_target_network()
+            result = self.learn_DDQN_jepa_coupled(self.networks, self.gsp_networks)
+            self.last_e2e_diagnostics = result
+            if result is not None:
+                self.last_gsp_loss = result.get('jepa_pred_mse')
+                return result.get('ddqn_loss')
+            return None
 
         if self.networks['learning_scheme'] == 'DDQN' and self.gsp_e2e_enabled and self.gsp:
             self.replace_target_network()

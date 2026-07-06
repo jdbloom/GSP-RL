@@ -19,6 +19,7 @@ from gsp_rl.src.networks.jepa import JEPAEncoder, JEPAPredictor
 INPUT_DIM = 6
 LATENT_DIM = 32
 BATCH_SIZE = 16
+ACTION_DIM = 3
 
 
 class TestEncoderPredictorShape:
@@ -60,6 +61,90 @@ class TestEncoderPredictorShape:
         z = torch.randn(BATCH_SIZE, LATENT_DIM).to(pred.device)
         z_pred = pred(z)
         assert torch.isfinite(z_pred).all(), "Predictor output contains NaN or Inf"
+
+
+class TestActionConditionedPredictor:
+    """Flag GSP_JEPA_ACTION_COND — the predictor consumes (z_t, a_t)."""
+
+    def test_default_predictor_is_not_action_conditioned(self):
+        """Back-compat: with action_dim=0 (default) the predictor takes z only."""
+        pred = JEPAPredictor(latent_dim=LATENT_DIM, hidden=64)
+        assert pred.action_dim == 0
+        z = torch.randn(BATCH_SIZE, LATENT_DIM).to(pred.device)
+        # Single-arg call still works and returns latent_dim.
+        out = pred(z)
+        assert out.shape == (BATCH_SIZE, LATENT_DIM)
+
+    def test_action_conditioned_predictor_consumes_action(self):
+        """With action_dim>0 the predictor's fc1 input width == latent+action."""
+        pred = JEPAPredictor(latent_dim=LATENT_DIM, hidden=64, action_dim=ACTION_DIM)
+        assert pred.action_dim == ACTION_DIM
+        assert pred.fc1.weight.shape[1] == LATENT_DIM + ACTION_DIM
+        z = torch.randn(BATCH_SIZE, LATENT_DIM).to(pred.device)
+        a = torch.randn(BATCH_SIZE, ACTION_DIM).to(pred.device)
+        out = pred(z, a)
+        assert out.shape == (BATCH_SIZE, LATENT_DIM)
+
+    def test_action_conditioned_predictor_requires_action(self):
+        """Action-conditioned predictor must receive an action tensor."""
+        pred = JEPAPredictor(latent_dim=LATENT_DIM, hidden=64, action_dim=ACTION_DIM)
+        z = torch.randn(BATCH_SIZE, LATENT_DIM).to(pred.device)
+        with pytest.raises((TypeError, ValueError)):
+            pred(z)  # missing required action
+
+    def test_action_changes_prediction(self):
+        """Different actions must produce different predicted futures."""
+        pred = JEPAPredictor(latent_dim=LATENT_DIM, hidden=64, action_dim=ACTION_DIM)
+        z = torch.randn(BATCH_SIZE, LATENT_DIM).to(pred.device)
+        a1 = torch.zeros(BATCH_SIZE, ACTION_DIM).to(pred.device)
+        a2 = torch.ones(BATCH_SIZE, ACTION_DIM).to(pred.device)
+        out1 = pred(z, a1)
+        out2 = pred(z, a2)
+        assert not torch.allclose(out1, out2), (
+            "Action-conditioned predictor ignored the action input"
+        )
+
+
+class TestCosineLatentLoss:
+    """Flag GSP_JEPA_COSINE_LOSS — normalized/cosine latent loss (SPR 2007.05929)."""
+
+    def test_cosine_loss_zero_on_identical(self):
+        """Cosine loss between a latent and itself is ~0 (perfect similarity)."""
+        from gsp_rl.src.actors.learning_aids import jepa_cosine_loss
+        z = torch.randn(BATCH_SIZE, LATENT_DIM)
+        loss = jepa_cosine_loss(z, z.clone())
+        assert torch.isclose(loss, torch.tensor(0.0), atol=1e-5), (
+            f"Cosine loss on identical latents should be 0, got {loss.item()}"
+        )
+
+    def test_cosine_loss_scale_invariant(self):
+        """Cosine loss is invariant to positive scaling of either argument."""
+        from gsp_rl.src.actors.learning_aids import jepa_cosine_loss
+        pred = torch.randn(BATCH_SIZE, LATENT_DIM)
+        target = torch.randn(BATCH_SIZE, LATENT_DIM)
+        base = jepa_cosine_loss(pred, target)
+        scaled = jepa_cosine_loss(pred * 7.0, target * 0.3)
+        assert torch.isclose(base, scaled, atol=1e-5), (
+            "Cosine loss must be invariant to positive rescaling of inputs"
+        )
+
+    def test_cosine_loss_max_on_opposite(self):
+        """Cosine loss between opposite vectors is ~2 (1 - (-1))."""
+        from gsp_rl.src.actors.learning_aids import jepa_cosine_loss
+        z = torch.randn(BATCH_SIZE, LATENT_DIM)
+        loss = jepa_cosine_loss(z, -z)
+        assert torch.isclose(loss, torch.tensor(2.0), atol=1e-5), (
+            f"Cosine loss on opposite latents should be 2, got {loss.item()}"
+        )
+
+    def test_cosine_loss_differentiable(self):
+        """Cosine loss must produce a gradient on the prediction argument."""
+        from gsp_rl.src.actors.learning_aids import jepa_cosine_loss
+        pred = torch.randn(BATCH_SIZE, LATENT_DIM, requires_grad=True)
+        target = torch.randn(BATCH_SIZE, LATENT_DIM)
+        loss = jepa_cosine_loss(pred, target)
+        loss.backward()
+        assert pred.grad is not None and torch.isfinite(pred.grad).all()
 
 
 class TestTargetEmaUpdate:
