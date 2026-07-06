@@ -664,6 +664,17 @@ class Actor(NetworkAids):
         loss = None
         scheme = self.gsp_networks['learning_scheme']
         if scheme == 'JEPA':
+            # Under value-coupling, learn_DDQN_jepa_coupled (called from learn())
+            # already trains the encoder's self-prediction loss jointly with the
+            # value loss on the SAME encoder, and sets last_gsp_jepa_stats. Running
+            # the standalone self-prediction step here would (a) double-train the
+            # self-prediction relative to the value loss, and (b) crash under
+            # action-conditioning — this JEPA buffer stores (state_t, state_{t+k})
+            # with no action slot, so it cannot pass the action tensor the
+            # action-conditioned predictor (action_dim>0) requires. Skip it; the
+            # coupled step subsumes it.
+            if getattr(self, 'gsp_jepa_couple_value', False):
+                return
             loss = self.learn_gsp_jepa(self.gsp_networks)
         elif scheme == 'attention':
             loss = self.learn_attention(self.gsp_networks)
