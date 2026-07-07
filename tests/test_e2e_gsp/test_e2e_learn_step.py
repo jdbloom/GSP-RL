@@ -253,3 +253,44 @@ class TestLearnDDQNE2ELearnStepCounter:
         before = networks['learn_step_counter']
         aids.learn_DDQN_e2e(networks, gsp_networks)
         assert networks['learn_step_counter'] == before + 1
+
+
+class TestLearnDDQNE2EActorSpliceScale:
+    """Regression: the value spliced into the ACTOR's GSP slot must be scaled to
+    match agent.make_agent_state (RL-CT), which writes degrees(pred/10) =
+    pred * (180/pi/10) ~= pred * 5.7296. The learn path previously spliced the RAW
+    head output, so the Q-net was trained on a ~5.73x-smaller value than it saw at
+    act-time and than the stored next-state slot — an internally inconsistent
+    Bellman update that stopped the E2E actor learning the task. The head's
+    supervised MSE, by contrast, must stay on the RAW prediction."""
+
+    def test_actor_slot_is_scaled_head_output_not_raw(self, setup):
+        aids, networks, gsp_networks = setup
+        cap = {}
+        head_fwd = gsp_networks['actor'].forward
+        q_fwd = networks['q_eval'].forward
+
+        def head_spy(x):
+            out = head_fwd(x)
+            cap['pred'] = out.detach().clone()
+            return out
+
+        def q_spy(x):
+            if 'aug' not in cap:            # first q_eval call is on the augmented current state
+                cap['aug'] = x.detach().clone()
+            return q_fwd(x)
+
+        gsp_networks['actor'].forward = head_spy
+        networks['q_eval'].forward = q_spy
+        aids.learn_DDQN_e2e(networks, gsp_networks)
+
+        scale = float(np.degrees(1.0) / 10.0)   # == degrees(x/10)/x ~= 5.7296
+        pred = cap['pred'].reshape(-1, 1)        # (batch, 1) raw head output
+        slot = cap['aug'][:, ENV_OBS_SIZE:ENV_OBS_SIZE + 1]  # the actor's GSP feature
+        assert T.allclose(slot, pred * scale, atol=1e-5), (
+            "actor GSP slot must be the SCALED head output (degrees/10), not raw"
+        )
+        # And it must NOT be the raw prediction (guard against a silent revert).
+        assert not T.allclose(slot, pred, atol=1e-4), (
+            "actor GSP slot equals the RAW pred — the act/learn scale mismatch is back"
+        )

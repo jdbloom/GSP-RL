@@ -996,9 +996,22 @@ class NetworkAids(Hyperparameters):
         # --- 3. Replace stale GSP scalar in state ---
         # State layout: [env_obs(input_size), gsp_scalar(1), optional_gk(...)]
         # self.input_size is the raw env obs dimensionality (e.g. 31).
+        #
+        # CRITICAL: the actor's GSP slot must use the SAME representation at
+        # act-time and learn-time. At act/store-time, agent.make_agent_state
+        # (RL-CT) writes the scalar as np.degrees(pred/10) = pred * (180/pi/10)
+        # (the historical delta_theta_1d scaling). This learn path re-runs the
+        # head and previously spliced the RAW pred, so the Q-net was trained on a
+        # ~5.73x-smaller value than it sees when acting AND than the stored
+        # next-state slot — an internally inconsistent Bellman update on that
+        # feature that prevented the E2E actor from learning the task. Apply the
+        # identical scaling here so current-state, next-state, and inference agree.
+        # The head's supervised MSE below still uses the RAW pred (the label is raw).
+        _GSP_ACTOR_SCALE = float(np.degrees(1.0) / 10.0)  # == degrees(x/10)/x
+        gsp_pred_actor = gsp_pred * _GSP_ACTOR_SCALE
         gsp_idx = self.input_size
         augmented = T.cat(
-            [states[:, :gsp_idx], gsp_pred, states[:, gsp_idx + 1:]], dim=1
+            [states[:, :gsp_idx], gsp_pred_actor, states[:, gsp_idx + 1:]], dim=1
         )
         augmented.retain_grad()
 
