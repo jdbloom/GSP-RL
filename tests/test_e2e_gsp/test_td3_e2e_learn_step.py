@@ -148,6 +148,18 @@ def fill_replay(replay: ReplayBuffer, n: int) -> None:
                                 gsp_obs=gsp_obs, gsp_label=gsp_label)
 
 
+def fill_replay_no_gsp(replay: ReplayBuffer, n: int) -> None:
+    """Fill a LEGACY continuous buffer (no gsp_obs_size) — the real-env build
+    that crashed learn_TD3_e2e's 7-value unpack."""
+    rng = np.random.default_rng(42)
+    for _ in range(n):
+        state = rng.standard_normal(AUGMENTED_OBS_SIZE).astype(np.float32)
+        action = rng.uniform(-MIN_MAX_ACTION, MIN_MAX_ACTION, ACTION_DIM).astype(np.float32)
+        state_ = rng.standard_normal(AUGMENTED_OBS_SIZE).astype(np.float32)
+        replay.store_transition(state, action, float(rng.standard_normal()),
+                                state_, bool(rng.integers(0, 2)))
+
+
 @pytest.fixture
 def setup():
     """Shared fixture: aids + td3 networks + gsp_networks with a filled buffer."""
@@ -156,6 +168,78 @@ def setup():
     gsp_networks = make_gsp_networks()
     fill_replay(networks['replay'], MEM_SIZE)
     return aids, networks, gsp_networks
+
+
+class TestTD3E2EReplayBufferArity:
+    """Regression for the runtime crash: the CONTINUOUS TD3 replay buffer must be
+    allocated with gsp_obs_size > 0 for e2e, so sample_buffer returns the 7-tuple
+    (states, actions, rewards, next_states, dones, gsp_obs, gsp_labels) that
+    learn_TD3_e2e unpacks. Without gsp_obs_size the continuous buffer returns only
+    5 values and the e2e unpack raises 'not enough values to unpack (expected 7,
+    got 5)'. These tests pin the buffer-arity contract Actor.build_networks must
+    satisfy for TD3+e2e — the coverage the original unit tests missed."""
+
+    def test_continuous_buffer_without_gsp_returns_five(self):
+        """Documents the crash condition: a Continuous buffer built the LEGACY way
+        (no gsp_obs_size) returns 5 values — the exact shape that broke the unpack."""
+        replay = ReplayBuffer(
+            max_size=MEM_SIZE,
+            num_observations=AUGMENTED_OBS_SIZE,
+            num_actions=ACTION_DIM,
+            action_type='Continuous',
+        )
+        fill_replay_no_gsp(replay, MEM_SIZE)
+        result = replay.sample_buffer(BATCH_SIZE)
+        assert len(result) == 5, (
+            "Continuous buffer without gsp_obs_size must return 5 values — this is "
+            "the shape that crashed learn_TD3_e2e's 7-value unpack in the real env"
+        )
+
+    def test_continuous_buffer_with_gsp_returns_seven_and_is_coindexed(self):
+        """The FIX: a Continuous buffer built with gsp_obs_size > 0 returns 7
+        values, with gsp_obs/gsp_labels co-indexed with the main transition (the
+        single-buffer alignment learn_DDQN_e2e relies on)."""
+        replay = ReplayBuffer(
+            max_size=MEM_SIZE,
+            num_observations=AUGMENTED_OBS_SIZE,
+            num_actions=ACTION_DIM,
+            action_type='Continuous',
+            gsp_obs_size=GSP_OBS_SIZE,
+        )
+        rng = np.random.default_rng(7)
+        for _ in range(MEM_SIZE):
+            state = rng.standard_normal(AUGMENTED_OBS_SIZE).astype(np.float32)
+            action = rng.uniform(-MIN_MAX_ACTION, MIN_MAX_ACTION, ACTION_DIM).astype(np.float32)
+            gsp_obs = rng.standard_normal(GSP_OBS_SIZE).astype(np.float32)
+            # label = sum(gsp_obs) so we can assert obs/label stay paired.
+            gsp_label = np.array([float(gsp_obs.sum())], dtype=np.float32)
+            replay.store_transition(
+                state, action, 0.0,
+                rng.standard_normal(AUGMENTED_OBS_SIZE).astype(np.float32),
+                False, gsp_obs=gsp_obs, gsp_label=gsp_label,
+            )
+        result = replay.sample_buffer(BATCH_SIZE)
+        assert len(result) == 7, "Continuous buffer with gsp_obs_size must return 7 values"
+        _, _, _, _, _, gsp_obs_b, gsp_labels_b = result
+        assert gsp_obs_b.shape == (BATCH_SIZE, GSP_OBS_SIZE)
+        assert gsp_labels_b.shape == (BATCH_SIZE, 1)
+        assert np.allclose(gsp_labels_b[:, 0], gsp_obs_b.sum(axis=1), atol=1e-4), (
+            "gsp_obs and gsp_labels are not co-indexed after sampling"
+        )
+
+    def test_learn_td3_e2e_runs_end_to_end_through_real_sample_arity(self):
+        """End-to-end: a full learn_TD3_e2e step against a Continuous buffer built
+        the fixed way, exercising the REAL sample_buffer 7-value unpack path — the
+        guard against a regression to the 5-value continuous buffer."""
+        aids = make_aids()
+        networks = make_td3_networks()   # buffer already has gsp_obs_size > 0
+        gsp_networks = make_gsp_networks()
+        fill_replay(networks['replay'], MEM_SIZE)
+        # Must not raise ValueError on the 7-value unpack.
+        result = aids.learn_TD3_e2e(networks, gsp_networks)
+        assert isinstance(result, dict)
+        assert np.isfinite(result['critic_loss'])
+        assert np.isfinite(result['gsp_mse_loss'])
 
 
 class TestLearnTD3E2EDiagnosticsDict:

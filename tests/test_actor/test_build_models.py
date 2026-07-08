@@ -271,3 +271,76 @@ def test_build_gsp_networks_Attention():
         shape = tuple(param.size())
         if name == 'fc_out.weight':
             assert(shape[0] == nn_args['gsp_output_size'])
+
+
+def test_build_networks_TD3_e2e_replay_carries_gsp_arrays():
+    """Regression: with GSP_E2E_ENABLED the TD3 (continuous) build must allocate
+    the main replay with gsp_obs_size > 0, so sample_buffer returns the 7-tuple
+    learn_TD3_e2e unpacks. The original TD3 build omitted gsp_obs_size, so the
+    continuous buffer returned 5 values and the e2e learn step crashed with
+    'not enough values to unpack (expected 7, got 5)' in the real env."""
+    import numpy as np
+    e2e_config = dict(config)
+    e2e_config['GSP_E2E_ENABLED'] = True
+    nn_args = {
+            'id':1,
+            'network': 'TD3',
+            'input_size':32,
+            'output_size':2,
+            'meta_param_size':2,
+            'gsp':True,
+            'recurrent_gsp':False,
+            'attention': False,
+            'gsp_input_size': 6,
+            'gsp_output_size': 1,
+            'gsp_look_back':2,
+            'gsp_sequence_length': 5,
+            'config': e2e_config,
+            'min_max_action':1.0,
+    }
+    actor = Actor(**nn_args)
+    replay = actor.networks['replay']
+    assert replay.gsp_obs_size == nn_args['gsp_input_size'], (
+        "TD3 e2e replay must be built with gsp_obs_size == gsp_input_size"
+    )
+    # Fill and confirm the REAL sample arity is 7 (not the 5 that crashed).
+    obs_w = replay.state_memory.shape[1]
+    for _ in range(actor.batch_size + 5):
+        replay.store_transition(
+            np.zeros(obs_w, dtype=np.float32),
+            np.zeros(nn_args['output_size'], dtype=np.float32),
+            0.0,
+            np.zeros(obs_w, dtype=np.float32),
+            False,
+            gsp_obs=np.zeros(nn_args['gsp_input_size'], dtype=np.float32),
+            gsp_label=np.zeros(1, dtype=np.float32),
+        )
+    result = replay.sample_buffer(actor.batch_size)
+    assert len(result) == 7, (
+        "TD3 e2e main replay must return 7 values (incl. gsp_obs, gsp_labels)"
+    )
+
+
+def test_build_networks_TD3_non_e2e_replay_has_no_gsp_arrays():
+    """Guard the inverse: a plain TD3 build (no e2e) must NOT allocate gsp arrays,
+    preserving the legacy 5-value continuous buffer."""
+    nn_args = {
+            'id':1,
+            'network': 'TD3',
+            'input_size':32,
+            'output_size':2,
+            'meta_param_size':2,
+            'gsp':False,
+            'recurrent_gsp':False,
+            'attention': False,
+            'gsp_input_size': 6,
+            'gsp_output_size': 1,
+            'gsp_look_back':2,
+            'gsp_sequence_length': 5,
+            'config': config,
+            'min_max_action':1.0,
+    }
+    actor = Actor(**nn_args)
+    assert actor.networks['replay'].gsp_obs_size == 0, (
+        "Plain TD3 (no e2e) must keep the legacy continuous buffer (gsp_obs_size==0)"
+    )
