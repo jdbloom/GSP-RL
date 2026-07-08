@@ -344,3 +344,106 @@ def test_build_networks_TD3_non_e2e_replay_has_no_gsp_arrays():
     assert actor.networks['replay'].gsp_obs_size == 0, (
         "Plain TD3 (no e2e) must keep the legacy continuous buffer (gsp_obs_size==0)"
     )
+
+
+def test_build_networks_TD3_e2e_dtraj_allocates_K_wide_label_buffer():
+    """Regression (job 2478, 2026-07-08): TD3 + GSP_PREDICTION_TARGET=delta_theta_traj
+    + GSP_PREDICTION_HORIZON=5 crashed at ep0 in ReplayBuffer.store_transition with
+    'could not broadcast input array from shape (5,) into shape (1,)'.
+
+    The size-K trajectory head predicts a K-vector, so the co-indexed E2E label
+    column must be K wide too. The DDQN path already derived gsp_label_size from
+    gsp_network_output; the TD3 build omitted it and defaulted to width 1. This
+    pins the K-wide allocation AND that a shape-(K,) label round-trips through
+    store_transition without broadcasting error."""
+    import numpy as np
+    K = 5
+    e2e_config = dict(config)
+    e2e_config['GSP_E2E_ENABLED'] = True
+    e2e_config['GSP_PREDICTION_TARGET'] = 'delta_theta_traj'
+    e2e_config['GSP_OUTPUT_KIND'] = 'delta_theta_traj'
+    e2e_config['GSP_PREDICTION_HORIZON'] = K
+    nn_args = {
+            'id':1,
+            'network': 'TD3',
+            'input_size':32,
+            'output_size':2,
+            'meta_param_size':2,
+            'gsp':True,
+            'recurrent_gsp':False,
+            'attention': False,
+            'gsp_input_size': 6,
+            'gsp_output_size': 1,
+            'gsp_look_back':2,
+            'gsp_sequence_length': 5,
+            'config': e2e_config,
+            'min_max_action':1.0,
+    }
+    actor = Actor(**nn_args)
+    assert actor.gsp_network_output == K, (
+        "delta_theta_traj + horizon=5 must resolve gsp_network_output to K=5"
+    )
+    replay = actor.networks['replay']
+    assert replay.gsp_label_size == K, (
+        "TD3 dtraj E2E replay must allocate a K-wide gsp_label column"
+    )
+    assert replay.gsp_label_memory.shape[1] == K
+    # Reproduce the crash path: storing a shape-(K,) label must not raise.
+    obs_w = replay.state_memory.shape[1]
+    known_label = np.arange(K, dtype=np.float32)
+    replay.store_transition(
+        np.zeros(obs_w, dtype=np.float32),
+        np.zeros(nn_args['output_size'], dtype=np.float32),
+        0.0,
+        np.zeros(obs_w, dtype=np.float32),
+        False,
+        gsp_obs=np.zeros(nn_args['gsp_input_size'], dtype=np.float32),
+        gsp_label=known_label,
+    )
+    np.testing.assert_array_almost_equal(
+        replay.gsp_label_memory[0], known_label,
+        err_msg="shape-(K,) label must round-trip into the K-wide column"
+    )
+
+
+def test_build_networks_TD3_e2e_scalar_label_buffer_unchanged():
+    """K=1 regression: a scalar-target TD3 E2E build must keep the gsp_label
+    column at width 1 exactly as before (byte-identical legacy path)."""
+    import numpy as np
+    e2e_config = dict(config)
+    e2e_config['GSP_E2E_ENABLED'] = True
+    nn_args = {
+            'id':1,
+            'network': 'TD3',
+            'input_size':32,
+            'output_size':2,
+            'meta_param_size':2,
+            'gsp':True,
+            'recurrent_gsp':False,
+            'attention': False,
+            'gsp_input_size': 6,
+            'gsp_output_size': 1,
+            'gsp_look_back':2,
+            'gsp_sequence_length': 5,
+            'config': e2e_config,
+            'min_max_action':1.0,
+    }
+    actor = Actor(**nn_args)
+    replay = actor.networks['replay']
+    assert replay.gsp_label_size == 1, (
+        "Scalar-target TD3 E2E replay must keep the width-1 gsp_label column"
+    )
+    assert replay.gsp_label_memory.shape[1] == 1
+    obs_w = replay.state_memory.shape[1]
+    replay.store_transition(
+        np.zeros(obs_w, dtype=np.float32),
+        np.zeros(nn_args['output_size'], dtype=np.float32),
+        0.0,
+        np.zeros(obs_w, dtype=np.float32),
+        False,
+        gsp_obs=np.zeros(nn_args['gsp_input_size'], dtype=np.float32),
+        gsp_label=np.array([1.23], dtype=np.float32),
+    )
+    np.testing.assert_array_almost_equal(
+        replay.gsp_label_memory[0], np.array([1.23], dtype=np.float32)
+    )
