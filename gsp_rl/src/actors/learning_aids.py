@@ -449,6 +449,26 @@ class Hyperparameters:
                 f"Unknown GSP_OUTPUT_KIND '{self.gsp_output_kind}'. "
                 f"Valid values: {list(_GSP_OUTPUT_KIND_SIZES)}"
             )
+        # Keep GSP_OUTPUT_KIND consistent with GSP_PREDICTION_TARGET. The host
+        # (RL-CollectiveTransport agent.py) emits the label whose width is fixed
+        # by the TARGET, while the head/buffer width here is fixed by the KIND.
+        # For 'delta_theta_traj' the label is a size-K vector but the default kind
+        # 'delta_theta_1d' is scalar (O=1) — a mismatch that does NOT fail at
+        # config time but crashes ~mid-episode deep in the replay buffer with
+        # `could not broadcast (K,) into (1,)` (observed 2026-07-08, the dtraj
+        # arm). The output dim is fully determined by the target, so auto-derive
+        # the kind when it was left at the scalar default, and reject an explicit
+        # contradiction loudly. (O=1 targets like future_prox are dimensionally
+        # safe either way; this guards the horizon-coupled trajectory target.)
+        if self.gsp_prediction_target == 'delta_theta_traj':
+            if self.gsp_output_kind == 'delta_theta_1d':
+                self.gsp_output_kind = 'delta_theta_traj'
+            elif self.gsp_output_kind != 'delta_theta_traj':
+                raise ValueError(
+                    "GSP_PREDICTION_TARGET='delta_theta_traj' requires "
+                    "GSP_OUTPUT_KIND='delta_theta_traj' (the size-K trajectory "
+                    f"output); got GSP_OUTPUT_KIND='{self.gsp_output_kind}'."
+                )
         _kind_size = _GSP_OUTPUT_KIND_SIZES[self.gsp_output_kind]
         if _kind_size is None:
             # Horizon-coupled kind: output dim == GSP_PREDICTION_HORIZON.
