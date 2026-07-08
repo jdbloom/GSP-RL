@@ -310,6 +310,16 @@ class Hyperparameters:
         self.gsp_e2e_enabled = bool(config.get('GSP_E2E_ENABLED', False))
         self.gsp_e2e_lambda = float(config.get('GSP_E2E_LAMBDA', 1.0))
         self.gsp_e2e_linear_output = bool(config.get('GSP_E2E_LINEAR_OUTPUT', False))
+        # GSP_E2E_STOP_GRAD_FEATURE (default False): when True, DETACH the GSP
+        # prediction where it is spliced into the actor's Q-input so the actor's
+        # TD gradient can no longer flow back into the head. The head then trains
+        # ONLY from its own supervised MSE loss (gsp_mse_loss stays on the raw,
+        # un-detached prediction). This removes the head↔critic coupling that makes
+        # the spliced feature non-stationary and prevents critic convergence. False
+        # preserves the exact prior behavior (TD gradient flows into the head).
+        self.gsp_e2e_stop_grad_feature = bool(
+            config.get('GSP_E2E_STOP_GRAD_FEATURE', False)
+        )
 
         # H-13 closure: LayerNorm in the main DQN/DDQN action network's trunk.
         # Independent of GSP_USE_LAYER_NORM (which only affects the GSP head).
@@ -1009,11 +1019,21 @@ class NetworkAids(Hyperparameters):
         # The head's supervised MSE below still uses the RAW pred (the label is raw).
         _GSP_ACTOR_SCALE = float(np.degrees(1.0) / 10.0)  # == degrees(x/10)/x
         gsp_pred_actor = gsp_pred * _GSP_ACTOR_SCALE
+        # GSP_E2E_STOP_GRAD_FEATURE: sever the actor's TD gradient at the splice so
+        # it cannot perturb the head. The supervised MSE below still uses the RAW,
+        # un-detached gsp_pred, so the head keeps learning to predict.
+        if self.gsp_e2e_stop_grad_feature:
+            gsp_pred_actor = gsp_pred_actor.detach()
         gsp_idx = self.input_size
         augmented = T.cat(
             [states[:, :gsp_idx], gsp_pred_actor, states[:, gsp_idx + 1:]], dim=1
         )
-        augmented.retain_grad()
+        # retain_grad is only valid (and the gsp_input_grad diagnostic only
+        # meaningful) when the actor-side feature carries grad. Under
+        # GSP_E2E_STOP_GRAD_FEATURE the spliced pred is detached, so `augmented`
+        # is a no-grad leaf and retain_grad would raise.
+        if augmented.requires_grad:
+            augmented.retain_grad()
 
         # --- 4. DDQN forward on augmented state ---
         indices = T.LongTensor(np.arange(self.batch_size).astype(np.int64))

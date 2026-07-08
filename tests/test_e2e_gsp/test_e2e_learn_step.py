@@ -294,3 +294,136 @@ class TestLearnDDQNE2EActorSpliceScale:
         assert not T.allclose(slot, pred, atol=1e-4), (
             "actor GSP slot equals the RAW pred — the act/learn scale mismatch is back"
         )
+
+
+class TestLearnDDQNE2EStopGradFeature:
+    """GSP_E2E_STOP_GRAD_FEATURE (default False) controls whether the actor's TD
+    gradient is allowed to flow back into the GSP head through the spliced Q-input
+    feature.
+
+    Motivation: the head is trained through BOTH its supervised MSE loss AND the
+    actor's TD gradient flowing back through the spliced feature. That coupling
+    makes the feature non-stationary and prevents the critic from converging. With
+    the flag ON we DETACH the prediction where it enters the actor's Q-input, so
+    the actor's TD gradient no longer perturbs the head — the head then trains ONLY
+    from its own MSE loss (which must stay attached to the un-detached prediction).
+
+    The cleanest observable check: spy on the tensor spliced into the actor's
+    Q-input (the augmented state) and on the tensor fed to F.mse_loss:
+      * flag ON  -> spliced feature is detached (requires_grad == False)
+      * flag OFF -> spliced feature carries grad (requires_grad == True)
+      * MSE input requires grad in BOTH cases (head still learns from MSE)
+    And the flag defaults to False, preserving byte-identical prior behavior.
+    """
+
+    def _spy_grad_flags(self, aids, networks, gsp_networks):
+        """Run one learn step, capturing requires_grad of the actor's GSP slot and
+        the tensor passed to F.mse_loss. Returns (slot_requires_grad,
+        mse_pred_requires_grad, gsp_head_grad_present)."""
+        import gsp_rl.src.actors.learning_aids as la
+
+        cap = {}
+        gsp_idx = aids.input_size
+        q_fwd = networks['q_eval'].forward
+
+        def q_spy(x):
+            # First q_eval call is on the augmented current state (grad path).
+            if 'slot_rg' not in cap:
+                # The spliced GSP feature column of the augmented state.
+                cap['slot_rg'] = bool(x[:, gsp_idx:gsp_idx + 1].requires_grad)
+            return q_fwd(x)
+
+        real_mse = la.F.mse_loss
+
+        def mse_spy(pred, target, *a, **kw):
+            cap['mse_pred_rg'] = bool(pred.requires_grad)
+            return real_mse(pred, target, *a, **kw)
+
+        networks['q_eval'].forward = q_spy
+        la.F.mse_loss = mse_spy
+        try:
+            aids.learn_DDQN_e2e(networks, gsp_networks)
+        finally:
+            la.F.mse_loss = real_mse
+
+        # After the step, the GSP head must have received gradient (from the MSE
+        # loss even when the actor-side feature is detached). We can only observe
+        # this indirectly: params changed. Snapshot-based check is done separately;
+        # here we confirm at least one head param carries a grad after backward.
+        head_grad_present = any(
+            p.grad is not None and float(p.grad.abs().sum()) > 0.0
+            for p in gsp_networks['actor'].parameters()
+        )
+        return cap['slot_rg'], cap['mse_pred_rg'], head_grad_present
+
+    def test_default_flag_is_false(self, setup):
+        aids, networks, gsp_networks = setup
+        assert aids.gsp_e2e_stop_grad_feature is False, (
+            "GSP_E2E_STOP_GRAD_FEATURE must default to False"
+        )
+
+    def test_flag_off_actor_feature_carries_grad(self, setup):
+        aids, networks, gsp_networks = setup
+        aids.gsp_e2e_stop_grad_feature = False
+        slot_rg, mse_pred_rg, head_grad = self._spy_grad_flags(
+            aids, networks, gsp_networks
+        )
+        assert slot_rg is True, (
+            "With the flag OFF the actor's spliced GSP feature must require grad "
+            "(TD gradient flows into the head) — preserves prior behavior"
+        )
+        assert mse_pred_rg is True, "MSE must be computed on a grad-carrying pred"
+        assert head_grad is True, "GSP head must receive gradient"
+
+    def test_flag_on_actor_feature_is_detached_but_mse_still_trains_head(self, setup):
+        aids, networks, gsp_networks = setup
+        aids.gsp_e2e_stop_grad_feature = True
+        slot_rg, mse_pred_rg, head_grad = self._spy_grad_flags(
+            aids, networks, gsp_networks
+        )
+        assert slot_rg is False, (
+            "With the flag ON the actor's spliced GSP feature must be DETACHED "
+            "(requires_grad == False) so the TD gradient cannot perturb the head"
+        )
+        assert mse_pred_rg is True, (
+            "Even with the flag ON, F.mse_loss must run on the UN-detached pred so "
+            "the head still learns to predict from its own supervised loss"
+        )
+        assert head_grad is True, (
+            "With the flag ON the head must STILL receive gradient — from the MSE "
+            "loss — even though the actor TD gradient is severed"
+        )
+
+    def test_flag_on_head_still_updates(self, setup):
+        """End-to-end: with the flag ON the GSP head params must still change,
+        driven purely by the MSE loss."""
+        aids, networks, gsp_networks = setup
+        aids.gsp_e2e_stop_grad_feature = True
+        before = {k: v.clone() for k, v in gsp_networks['actor'].state_dict().items()}
+        aids.learn_DDQN_e2e(networks, gsp_networks)
+        after = gsp_networks['actor'].state_dict()
+        changed = any(not T.allclose(before[k], after[k]) for k in before)
+        assert changed, (
+            "With the flag ON the GSP head must still update from its MSE loss"
+        )
+
+    def test_flag_on_ddqn_still_updates(self, setup):
+        """The actor (DDQN) must still learn with the flag ON — only the gradient
+        path INTO the head is cut, not the actor's own updates."""
+        aids, networks, gsp_networks = setup
+        aids.gsp_e2e_stop_grad_feature = True
+        before = {k: v.clone() for k, v in networks['q_eval'].state_dict().items()}
+        aids.learn_DDQN_e2e(networks, gsp_networks)
+        after = networks['q_eval'].state_dict()
+        changed = any(not T.allclose(before[k], after[k]) for k in before)
+        assert changed, "DDQN q_eval must still update with the flag ON"
+
+    def test_config_key_read_from_constructor(self):
+        """The flag is read from the SAME config source as GSP_E2E_LAMBDA, under
+        the key GSP_E2E_STOP_GRAD_FEATURE."""
+        cfg = dict(MINIMAL_CONFIG)
+        cfg['GSP_E2E_STOP_GRAD_FEATURE'] = True
+        aids = NetworkAids(cfg)
+        assert aids.gsp_e2e_stop_grad_feature is True, (
+            "NetworkAids must read GSP_E2E_STOP_GRAD_FEATURE from config"
+        )
