@@ -361,7 +361,14 @@ class Actor(NetworkAids):
                 'output_size':self.output_size}
             self.networks = self.build_TD3(actor_nn_args, critic_nn_args)
             self.networks['learning_scheme'] = 'TD3'
-            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, self.output_size, 'Continuous', recency_halflife=self.recency_halflife)
+            # Cross-head e2e: the GSP arrays are stored co-indexed in the MAIN
+            # replay (same mechanism as DDQN e2e, line ~297), so learn_TD3_e2e's
+            # single 7-return sample_buffer stays aligned (gsp_obs[i]/gsp_labels[i]
+            # correspond to states[i]). Without gsp_obs_size the continuous buffer
+            # returns only 5 values and the e2e unpack fails at runtime.
+            _needs_gsp_obs = self.gsp_e2e_enabled
+            gsp_obs_sz = self.gsp_network_input if _needs_gsp_obs else 0
+            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, self.output_size, 'Continuous', gsp_obs_size=gsp_obs_sz, recency_halflife=self.recency_halflife)
             self.networks['output_size'] = self.output_size
             self.networks['learn_step_counter'] = 0
         else:
