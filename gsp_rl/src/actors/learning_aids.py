@@ -1023,22 +1023,34 @@ class NetworkAids(Hyperparameters):
         if gsp_pred.dim() == 1:
             gsp_pred = gsp_pred.unsqueeze(1)
 
-        # --- 3. Replace stale GSP scalar in state ---
-        # State layout: [env_obs(input_size), gsp_scalar(1), optional_gk(...)]
-        # self.input_size is the raw env obs dimensionality (e.g. 31).
-        #
+        # --- 3. Replace stale GSP prediction slot in state ---
+        # State layout: [env_obs(input_size), gsp_pred(K), optional_gk(...)]
+        # self.input_size is the raw env obs dimensionality (e.g. 31); the GSP
+        # slot is gsp_network_output (K) wide — K=1 for the legacy scalar target,
+        # K>1 for the size-K trajectory target (delta_theta_traj). The splice must
+        # remove exactly K stale columns and insert exactly K fresh ones; slicing
+        # a fixed width-1 slot left K-1 stale columns in place and grew the
+        # augmented width past the Q-net's input, crashing the forward with
+        # `mat1 and mat2 shapes cannot be multiplied` (confirmed 2026-07-08).
+        _gsp_slot = int(getattr(self, 'gsp_network_output', 1))
         # CRITICAL: the actor's GSP slot must use the SAME representation at
         # act-time and learn-time. At act/store-time, agent.make_agent_state
-        # (RL-CT) writes the scalar as np.degrees(pred/10) = pred * (180/pi/10)
-        # (the historical delta_theta_1d scaling). This learn path re-runs the
-        # head and previously spliced the RAW pred, so the Q-net was trained on a
-        # ~5.73x-smaller value than it sees when acting AND than the stored
-        # next-state slot — an internally inconsistent Bellman update on that
-        # feature that prevented the E2E actor from learning the task. Apply the
-        # identical scaling here so current-state, next-state, and inference agree.
-        # The head's supervised MSE below still uses the RAW pred (the label is raw).
-        _GSP_ACTOR_SCALE = float(np.degrees(1.0) / 10.0)  # == degrees(x/10)/x
-        gsp_pred_actor = gsp_pred * _GSP_ACTOR_SCALE
+        # (RL-CT) writes the SCALAR (K==1) as np.degrees(pred/10) = pred *
+        # (180/pi/10) (the historical delta_theta_1d scaling), but for the VECTOR
+        # (K>1) path it concatenates the RAW prediction with no rescaling. This
+        # learn path re-runs the head and must mirror that exactly: scale only the
+        # scalar slot. Previously the RAW scalar was spliced, so the Q-net was
+        # trained on a ~5.73x-smaller value than it saw when acting AND than the
+        # stored next-state slot — an internally inconsistent Bellman update that
+        # prevented the E2E actor from learning. Applying the scale to a K>1 slot
+        # would re-introduce that same inconsistency vs the RAW vector path, so it
+        # is gated on K==1. The head's supervised MSE below always uses the RAW
+        # pred (the label is raw).
+        if _gsp_slot == 1:
+            _GSP_ACTOR_SCALE = float(np.degrees(1.0) / 10.0)  # == degrees(x/10)/x
+            gsp_pred_actor = gsp_pred * _GSP_ACTOR_SCALE
+        else:
+            gsp_pred_actor = gsp_pred
         # GSP_E2E_STOP_GRAD_FEATURE: sever the actor's TD gradient at the splice so
         # it cannot perturb the head. The supervised MSE below still uses the RAW,
         # un-detached gsp_pred, so the head keeps learning to predict.
@@ -1046,7 +1058,8 @@ class NetworkAids(Hyperparameters):
             gsp_pred_actor = gsp_pred_actor.detach()
         gsp_idx = self.input_size
         augmented = T.cat(
-            [states[:, :gsp_idx], gsp_pred_actor, states[:, gsp_idx + 1:]], dim=1
+            [states[:, :gsp_idx], gsp_pred_actor, states[:, gsp_idx + _gsp_slot:]],
+            dim=1,
         )
         # retain_grad is only valid (and the gsp_input_grad diagnostic only
         # meaningful) when the actor-side feature carries grad. Under
@@ -1553,17 +1566,26 @@ class NetworkAids(Hyperparameters):
         if gsp_pred.dim() == 1:
             gsp_pred = gsp_pred.unsqueeze(1)
 
-        # --- 3. Splice the fresh (scaled) GSP scalar into the CURRENT state ---
-        # Scaling and stop-grad semantics identical to learn_DDQN_e2e: the actor's
-        # GSP slot uses degrees(pred/10) to match make_agent_state at act/store
-        # time; the head's supervised MSE below still uses the RAW pred.
-        _GSP_ACTOR_SCALE = float(np.degrees(1.0) / 10.0)  # == degrees(x/10)/x
-        gsp_pred_actor = gsp_pred * _GSP_ACTOR_SCALE
+        # --- 3. Splice the fresh (scaled) GSP prediction into the CURRENT state ---
+        # Scaling, K-slot width, and stop-grad semantics identical to
+        # learn_DDQN_e2e: the GSP slot is gsp_network_output (K) wide; splice
+        # removes exactly K stale columns and inserts K fresh ones. The scalar
+        # (K==1) slot uses degrees(pred/10) to match make_agent_state at act/store
+        # time; the vector (K>1) path is RAW (make_agent_state does not rescale
+        # vectors). The head's supervised MSE below still uses the RAW pred.
+        _gsp_slot = int(getattr(self, 'gsp_network_output', 1))
+        if _gsp_slot == 1:
+            _GSP_ACTOR_SCALE = float(np.degrees(1.0) / 10.0)  # == degrees(x/10)/x
+            gsp_pred_actor = gsp_pred * _GSP_ACTOR_SCALE
+        else:
+            _GSP_ACTOR_SCALE = 1.0
+            gsp_pred_actor = gsp_pred
         if self.gsp_e2e_stop_grad_feature:
             gsp_pred_actor = gsp_pred_actor.detach()
         gsp_idx = self.input_size
         augmented = T.cat(
-            [states[:, :gsp_idx], gsp_pred_actor, states[:, gsp_idx + 1:]], dim=1
+            [states[:, :gsp_idx], gsp_pred_actor, states[:, gsp_idx + _gsp_slot:]],
+            dim=1,
         )
         # retain_grad only valid (and gsp_input_grad only meaningful) when the
         # actor-side feature carries grad — under stop-grad `augmented` is a
@@ -1665,7 +1687,9 @@ class NetworkAids(Hyperparameters):
         if self.gsp_e2e_stop_grad_feature:
             gsp_pred_actor_step = gsp_pred_actor_step.detach()
         augmented_actor = T.cat(
-            [states[:, :gsp_idx], gsp_pred_actor_step, states[:, gsp_idx + 1:]], dim=1
+            [states[:, :gsp_idx], gsp_pred_actor_step,
+             states[:, gsp_idx + _gsp_slot:]],
+            dim=1,
         )
 
         networks['actor'].optimizer.zero_grad()

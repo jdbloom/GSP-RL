@@ -39,6 +39,7 @@ class ReplayBuffer():
             gsp_obs_size: int = 0,
             recency_halflife: float = 0,
             phi_size: int = 0,
+            gsp_label_size: int = 1,
     ) -> None:
         """Initialize replay buffer.
 
@@ -48,8 +49,14 @@ class ReplayBuffer():
             num_actions: Action space dimensionality (1 for discrete).
             action_type: 'Discrete' (int storage) or 'Continuous' (float storage).
             gsp_obs_size: When > 0, allocates parallel gsp_obs_memory of shape
-                (max_size, gsp_obs_size) and gsp_label_memory of shape (max_size, 1)
-                for co-indexed GSP observation and Δθ label storage.
+                (max_size, gsp_obs_size) and gsp_label_memory of shape
+                (max_size, gsp_label_size) for co-indexed GSP observation and
+                Δθ label storage.
+            gsp_label_size: Width of the co-indexed GSP label column. Default 1
+                (the legacy scalar Δθ label) — byte-identical to all prior runs.
+                For the size-K trajectory target (delta_theta_traj) the E2E head
+                predicts a K-vector, so the label must be K wide too; the host
+                (RL-CollectiveTransport) passes gsp_network_output here.
             recency_halflife: Exponential half-life (in buffer stores) for recency-
                 weighted sampling.  0 (default) = OFF: uniform sampling, bit-identical
                 to all prior runs.  When > 0, recent transitions are sampled
@@ -64,6 +71,7 @@ class ReplayBuffer():
         self.mem_ctr = 0
         self.action_type = action_type
         self.gsp_obs_size = gsp_obs_size
+        self.gsp_label_size = gsp_label_size
         self.recency_halflife = recency_halflife
         self.phi_size = phi_size
         self.state_memory = np.zeros((self.mem_size, num_observations), dtype = np.float32)
@@ -78,13 +86,15 @@ class ReplayBuffer():
         self.terminal_memory = np.zeros((self.mem_size), dtype = np.bool_)
         if self.gsp_obs_size > 0:
             self.gsp_obs_memory = np.zeros((self.mem_size, gsp_obs_size), dtype=np.float32)
-            self.gsp_label_memory = np.zeros((self.mem_size, 1), dtype=np.float32)
+            self.gsp_label_memory = np.zeros(
+                (self.mem_size, gsp_label_size), dtype=np.float32
+            )
             # Cache a zero vector to avoid allocating np.zeros on every None-store.
             # Write-protect so any accidental mutation raises immediately rather
             # than silently corrupting future None-stores.
             self._zero_gsp_obs = np.zeros(gsp_obs_size, dtype=np.float32)
             self._zero_gsp_obs.flags.writeable = False
-            self._zero_gsp_label = np.zeros(1, dtype=np.float32)
+            self._zero_gsp_label = np.zeros(gsp_label_size, dtype=np.float32)
             self._zero_gsp_label.flags.writeable = False
         if self.phi_size > 0:
             self.phi_memory = np.zeros((self.mem_size, phi_size), dtype=np.float32)
