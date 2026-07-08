@@ -125,3 +125,58 @@ class TestInvalidKindRaises:
     def test_unknown_kind_raises_value_error(self):
         with pytest.raises(ValueError, match="Unknown GSP_OUTPUT_KIND"):
             _make_actor("not_a_valid_kind")
+
+
+def _make_actor_cfg(**overrides) -> Actor:
+    """Build a GSP Actor with arbitrary config overrides."""
+    config = {**BASE_CONFIG, **overrides}
+    return Actor(
+        id=0, config=config, network="DDQN", input_size=31, output_size=9,
+        min_max_action=1, meta_param_size=32, gsp=True, gsp_input_size=6,
+        gsp_output_size=1,
+    )
+
+
+class TestPredictionTargetKindConsistency:
+    """GSP_PREDICTION_TARGET='delta_theta_traj' must yield a size-K head + buffer.
+
+    Regression for 2026-07-08: the dtraj arm set GSP_PREDICTION_TARGET=delta_theta_traj
+    (host emits a size-K label) but left GSP_OUTPUT_KIND at the scalar default, so the
+    GSP replay buffer's action/label slot was width-1 and training crashed mid-episode
+    with `could not broadcast (K,) into (1,)`. The output dim is fully determined by the
+    target, so the kind is now auto-derived (and an explicit contradiction rejected).
+    """
+
+    def test_traj_target_autoderives_kind_and_sizes_head(self):
+        actor = _make_actor_cfg(GSP_PREDICTION_TARGET="delta_theta_traj")  # no GSP_OUTPUT_KIND
+        assert actor.gsp_output_kind == "delta_theta_traj"
+        assert actor.gsp_network_output == 5  # default GSP_PREDICTION_HORIZON
+        assert actor.gsp_networks["actor"].mu.out_features == 5
+
+    def test_traj_target_buffer_label_slot_is_size_k(self):
+        """The GSP replay buffer's action/label slot must be width-K (the crash site)."""
+        actor = _make_actor_cfg(GSP_PREDICTION_TARGET="delta_theta_traj",
+                                 GSP_PREDICTION_HORIZON=5)
+        buf = actor.gsp_networks["replay"]
+        assert buf.action_memory.shape == (actor.mem_size, 5), buf.action_memory.shape
+
+    def test_traj_target_respects_horizon(self):
+        actor = _make_actor_cfg(GSP_PREDICTION_TARGET="delta_theta_traj",
+                                 GSP_PREDICTION_HORIZON=3)
+        assert actor.gsp_network_output == 3
+        assert actor.gsp_networks["replay"].action_memory.shape[1] == 3
+
+    def test_consistent_explicit_kind_ok(self):
+        actor = _make_actor_cfg(GSP_PREDICTION_TARGET="delta_theta_traj",
+                                 GSP_OUTPUT_KIND="delta_theta_traj")
+        assert actor.gsp_network_output == 5
+
+    def test_contradictory_kind_raises(self):
+        with pytest.raises(ValueError, match="requires GSP_OUTPUT_KIND='delta_theta_traj'"):
+            _make_actor_cfg(GSP_PREDICTION_TARGET="delta_theta_traj",
+                            GSP_OUTPUT_KIND="future_prox_1d")
+
+    def test_scalar_target_unaffected(self):
+        """A scalar target (future_prox) is dimensionally safe and left untouched."""
+        actor = _make_actor_cfg(GSP_PREDICTION_TARGET="future_prox")
+        assert actor.gsp_network_output == 1
