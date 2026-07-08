@@ -1477,6 +1477,197 @@ class NetworkAids(Hyperparameters):
 
         return actor_loss.item()
 
+    def learn_TD3_e2e(self, networks, gsp_networks):
+        """End-to-end joint training of TD3 + GSP head (cross-head charter arm).
+
+        The continuous-actor mirror of ``learn_DDQN_e2e``. At each learn step the
+        GSP head is re-run WITH gradient on the stored gsp_obs, its (scaled,
+        optionally detached) prediction is spliced into the actor/critic CURRENT
+        state at index ``self.input_size`` (feature #32), and the head's own
+        supervised MSE loss is folded into the critic backward so the head trains
+        every learn step. The TD3 twin-critic update, target-policy smoothing, and
+        delayed actor update all follow ``learn_TD3``.
+
+        Current-vs-next state (mirrors ``learn_DDQN_e2e``):
+          * CURRENT state (feeds critic_1/critic_2 for the TD loss and the online
+            actor for the delayed policy loss): the stale stored GSP scalar is
+            REPLACED with the freshly re-run head prediction (scaled by
+            ``_GSP_ACTOR_SCALE`` = degrees(x/10)/x, detached iff
+            ``gsp_e2e_stop_grad_feature``). This is the only place the head's TD
+            gradient can enter the value networks.
+          * NEXT state (``states_``): used AS-STORED under ``T.no_grad()`` for the
+            target-actor + target-critics, exactly like ``learn_DDQN_e2e`` uses the
+            stored next-state. The stored ``states_`` already contains the scaled
+            feature #32 because RL-CT ``agent.make_agent_state`` writes
+            ``degrees(pred/10)`` into every acted (and therefore stored) state, so
+            current, next, and inference agree without re-running the head on the
+            next state.
+
+        The GSP head's MSE loss (on the RAW, un-detached prediction vs the label)
+        is added to the CRITIC loss so it is applied on EVERY learn step — the TD3
+        actor update is delayed (every ``update_actor_iter`` steps) and must not
+        gate the head's supervised training.
+
+        Returns a diagnostics dict shaped like ``learn_TD3``'s scalar losses plus
+        the GSP diagnostics ``learn_DDQN_e2e`` emits (so the h5 e2e logger captures
+        them). ``actor_loss`` is None on non-actor-update steps.
+        """
+        e2e_lambda = self.gsp_e2e_lambda
+        device = networks['critic_1'].device
+
+        # --- 1. Sample 7 values directly from main replay ---
+        result = networks['replay'].sample_buffer(self.batch_size)
+        states_np, actions_np, rewards_np, states_np_, dones_np, gsp_obs_np, gsp_labels_np = result
+
+        states = T.as_tensor(states_np, dtype=T.float32).to(device)
+        actions = T.as_tensor(np.asarray(actions_np, dtype=np.float32)).to(device)
+        rewards = T.as_tensor(rewards_np, dtype=T.float32).to(device)
+        states_ = T.as_tensor(states_np_, dtype=T.float32).to(device)
+        dones = T.as_tensor(dones_np).to(device)
+        gsp_obs = T.as_tensor(gsp_obs_np, dtype=T.float32).to(device)
+        gsp_labels = T.as_tensor(gsp_labels_np, dtype=T.float32).to(device)
+
+        # --- 2. Re-run GSP head WITH gradient ---
+        gsp_networks['actor'].optimizer.zero_grad()
+        gsp_pred = gsp_networks['actor'].forward(gsp_obs)
+        if gsp_pred.dim() == 1:
+            gsp_pred = gsp_pred.unsqueeze(1)
+
+        # --- 3. Splice the fresh (scaled) GSP scalar into the CURRENT state ---
+        # Scaling and stop-grad semantics identical to learn_DDQN_e2e: the actor's
+        # GSP slot uses degrees(pred/10) to match make_agent_state at act/store
+        # time; the head's supervised MSE below still uses the RAW pred.
+        _GSP_ACTOR_SCALE = float(np.degrees(1.0) / 10.0)  # == degrees(x/10)/x
+        gsp_pred_actor = gsp_pred * _GSP_ACTOR_SCALE
+        if self.gsp_e2e_stop_grad_feature:
+            gsp_pred_actor = gsp_pred_actor.detach()
+        gsp_idx = self.input_size
+        augmented = T.cat(
+            [states[:, :gsp_idx], gsp_pred_actor, states[:, gsp_idx + 1:]], dim=1
+        )
+        # retain_grad only valid (and gsp_input_grad only meaningful) when the
+        # actor-side feature carries grad — under stop-grad `augmented` is a
+        # no-grad leaf and retain_grad would raise.
+        if augmented.requires_grad:
+            augmented.retain_grad()
+
+        # --- 4. TD3 target: STORED next-state, no GSP re-run, no_grad ---
+        with T.no_grad():
+            target_actions = networks['target_actor'].forward(states_)
+            noise = T.clamp(
+                T.tensor(np.random.normal(0, 0.2, size=target_actions.shape).astype(np.float32)),
+                -0.5, 0.5
+            ).to(target_actions.device)
+            target_actions = T.clamp(
+                target_actions + noise, -self.min_max_action, self.min_max_action
+            )
+            q1_ = networks['target_critic_1'].forward(states_, target_actions)
+            q2_ = networks['target_critic_2'].forward(states_, target_actions)
+            q1_[dones] = 0.0
+            q2_[dones] = 0.0
+            q1_ = q1_.view(-1)
+            q2_ = q2_.view(-1)
+            critic_value_ = T.min(q1_, q2_)
+            target = self._q_target(rewards, critic_value_)
+
+        # --- 5. Twin-critic forward on the AUGMENTED current state ---
+        q1 = networks['critic_1'].forward(augmented, actions).squeeze()
+        q2 = networks['critic_2'].forward(augmented, actions).squeeze()
+
+        networks['critic_1'].optimizer.zero_grad()
+        networks['critic_2'].optimizer.zero_grad()
+
+        q1_loss = self._critic_loss_fn(target, q1)
+        q2_loss = self._critic_loss_fn(target, q2)
+        critic_loss = q1_loss + q2_loss
+
+        # --- 6. GSP head MSE on the RAW pred, applied EVERY learn step ---
+        if gsp_labels.dim() == gsp_pred.dim() - 1:
+            gsp_labels = gsp_labels.unsqueeze(-1)
+        else:
+            gsp_labels = gsp_labels.view_as(gsp_pred)
+        gsp_mse_loss = F.mse_loss(gsp_pred, gsp_labels)
+
+        combined_loss = critic_loss + e2e_lambda * gsp_mse_loss
+
+        combined_loss.backward()
+        _check_nan(combined_loss, f"TD3 e2e critic+gsp loss at step {networks['learn_step_counter']}")
+
+        # Pre-clip GSP grad norm for diagnostics
+        gsp_params = list(gsp_networks['actor'].parameters())
+        gsp_grad_norm_pre_clip = float(
+            T.norm(T.stack([p.grad.norm() for p in gsp_params if p.grad is not None]))
+        )
+        T.nn.utils.clip_grad_norm_(gsp_networks['actor'].parameters(), max_norm=1.0)
+        gsp_grad_norm = float(
+            T.norm(T.stack([p.grad.norm() for p in gsp_params if p.grad is not None]))
+        )
+
+        # Gradient at the GSP input dimension of the augmented state.
+        gsp_input_grad = None
+        if augmented.grad is not None:
+            gsp_input_grad = float(augmented.grad[:, gsp_idx].abs().mean().item())
+
+        self._clip_critic_grad(networks['critic_1'], networks['critic_2'])
+        networks['critic_1'].optimizer.step()
+        networks['critic_2'].optimizer.step()
+        gsp_networks['actor'].optimizer.step()
+
+        networks['learn_step_counter'] += 1
+
+        diagnostics = {
+            'critic_loss': critic_loss.item(),
+            'actor_loss': None,
+            'gsp_mse_loss': gsp_mse_loss.item(),
+            'gsp_grad_norm': gsp_grad_norm,
+            'gsp_grad_norm_pre_clip': gsp_grad_norm_pre_clip,
+            'gsp_input_grad': gsp_input_grad,
+            'gsp_pred_mean': float(gsp_pred.detach().mean().item()),
+            'gsp_pred_std': float(gsp_pred.detach().std().item()),
+            'gsp_label_mean': float(gsp_labels.detach().mean().item()),
+            'gsp_label_std': float(gsp_labels.detach().std().item()),
+        }
+
+        # --- 7. Delayed actor update (mirrors learn_TD3) ---
+        if networks['learn_step_counter'] % self.update_actor_iter != 0:
+            return diagnostics
+
+        # Re-run the head so the actor's policy loss sees a fresh spliced feature
+        # consistent with make_agent_state; scaled + optionally detached the same
+        # way. The head's optimizer already stepped this iteration, so DO NOT add
+        # this forward's MSE again — the actor loss trains the policy, and (when
+        # the feature carries grad) shapes the head via the actor's deterministic
+        # policy gradient exactly as the DDQN TD gradient does.
+        gsp_pred_actor_step = gsp_networks['actor'].forward(gsp_obs)
+        if gsp_pred_actor_step.dim() == 1:
+            gsp_pred_actor_step = gsp_pred_actor_step.unsqueeze(1)
+        gsp_pred_actor_step = gsp_pred_actor_step * _GSP_ACTOR_SCALE
+        if self.gsp_e2e_stop_grad_feature:
+            gsp_pred_actor_step = gsp_pred_actor_step.detach()
+        augmented_actor = T.cat(
+            [states[:, :gsp_idx], gsp_pred_actor_step, states[:, gsp_idx + 1:]], dim=1
+        )
+
+        networks['actor'].optimizer.zero_grad()
+        gsp_networks['actor'].optimizer.zero_grad()
+        actor_q1_loss = networks['critic_1'].forward(
+            augmented_actor, networks['actor'].forward(augmented_actor)
+        )
+        actor_loss = -T.mean(actor_q1_loss)
+        actor_loss.backward()
+        _check_nan(actor_loss, f"TD3 e2e actor loss at step {networks['learn_step_counter']}")
+        networks['actor'].optimizer.step()
+        # Let the actor's deterministic-policy gradient flow into the head too,
+        # unless it was detached at the splice (stop-grad flag).
+        if not self.gsp_e2e_stop_grad_feature:
+            T.nn.utils.clip_grad_norm_(gsp_networks['actor'].parameters(), max_norm=1.0)
+            gsp_networks['actor'].optimizer.step()
+
+        self.update_TD3_network_parameters(self.tau, networks)
+
+        diagnostics['actor_loss'] = actor_loss.item()
+        return diagnostics
+
     def learn_attention(self, networks):
         if networks['replay'].mem_ctr < self.gsp_batch_size:
             return 0

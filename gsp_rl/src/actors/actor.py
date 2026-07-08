@@ -657,6 +657,18 @@ class Actor(NetworkAids):
                 return result.get('ddqn_loss')  # Main.py expects a scalar, not a dict
             return None
 
+        # Cross-head charter arm: the same prediction-into-the-actor coupling on
+        # the TD3 continuous head. Target updates happen inside learn_TD3_e2e (only
+        # on actor-update steps), so no replace/update call here — mirrors the plain
+        # TD3 branch below. Main.py reads last_e2e_diagnostics for the h5 logger.
+        if self.networks['learning_scheme'] == 'TD3' and self.gsp_e2e_enabled and self.gsp:
+            result = self.learn_TD3_e2e(self.networks, self.gsp_networks)
+            self.last_e2e_diagnostics = result
+            if result is not None:
+                self.last_gsp_loss = result.get('gsp_mse_loss')
+                return result.get('critic_loss')  # Main.py expects a scalar, not a dict
+            return None
+
         # Successor-Features path (GSP_SF_ENABLED): Q = psi . w, psi trained by its
         # own TD loss and w by reward regression. Mutually exclusive with the
         # coupled-JEPA / e2e paths above (both return before reaching here).
