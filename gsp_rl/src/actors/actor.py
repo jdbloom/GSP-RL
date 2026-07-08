@@ -264,7 +264,12 @@ class Actor(NetworkAids):
                 self, 'gsp_jepa_couple_value', False
             )
             gsp_obs_sz = self.gsp_network_input if _needs_gsp_obs else 0
-            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, 1, 'Discrete', gsp_obs_size=gsp_obs_sz, recency_halflife=self.recency_halflife)
+            # E2E label width == head output width (K). For the size-K trajectory
+            # target the head predicts a K-vector, so the co-indexed E2E label
+            # column must be K wide too (learn_DDQN_e2e regresses pred_K vs
+            # label_K). Legacy scalar target -> K==1, byte-identical.
+            gsp_label_sz = int(self.gsp_network_output) if self.gsp_e2e_enabled else 1
+            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, 1, 'Discrete', gsp_obs_size=gsp_obs_sz, recency_halflife=self.recency_halflife, gsp_label_size=gsp_label_sz)
             self.networks['learn_step_counter'] = 0
         elif learning_scheme == 'DDQN':
             nn_args = {
@@ -295,7 +300,9 @@ class Actor(NetworkAids):
                 self, 'gsp_jepa_couple_value', False
             )
             gsp_obs_sz = self.gsp_network_input if _needs_gsp_obs else 0
-            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, 1, 'Discrete', gsp_obs_size=gsp_obs_sz, recency_halflife=self.recency_halflife, phi_size=_phi_sz)
+            # E2E label width == head output width (K) — see the DQN branch above.
+            gsp_label_sz = int(self.gsp_network_output) if self.gsp_e2e_enabled else 1
+            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, 1, 'Discrete', gsp_obs_size=gsp_obs_sz, recency_halflife=self.recency_halflife, phi_size=_phi_sz, gsp_label_size=gsp_label_sz)
             self.networks['learn_step_counter'] = 0
         elif learning_scheme == 'DDPG':
             actor_nn_args = {
