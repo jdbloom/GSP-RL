@@ -180,3 +180,40 @@ class TestPredictionTargetKindConsistency:
         """A scalar target (future_prox) is dimensionally safe and left untouched."""
         actor = _make_actor_cfg(GSP_PREDICTION_TARGET="future_prox")
         assert actor.gsp_network_output == 1
+
+
+class TestActorStateWidthInvariant:
+    """The runtime GSP head PREDICTION width must exactly fill the actor Q-net's
+    GSP augmentation slot.
+
+    Regression for the 2026-07-08 actor-forward crash (`mat1 and mat2 shapes
+    cannot be multiplied (64x40 and 36x64)`): the host concatenates the head's
+    size-K prediction onto the base obs to form the actor state, and the actor
+    net was built with network_input_size = input_size + gsp_network_output.
+    These must agree for K>1, i.e. the head's actual forward-pass output width
+    equals (network_input_size - input_size). This asserts the GSP-RL half of
+    the cross-repo invariant (the RL-CT host asserts make_agent_state matches).
+    """
+
+    def test_head_prediction_fills_actor_gsp_slot(self):
+        import numpy as np
+        import torch as T
+        for K in (1, 3, 5):
+            actor = _make_actor_cfg(
+                GSP_PREDICTION_TARGET="delta_theta_traj",
+                GSP_PREDICTION_HORIZON=K,
+            )
+            gsp_slot = actor.network_input_size - actor.input_size
+            assert gsp_slot == K, (
+                f"K={K}: actor GSP augmentation slot {gsp_slot} != K"
+            )
+            # Run the actual GSP head forward; its prediction width must equal
+            # the slot the actor net reserved for it.
+            gsp_net = actor.gsp_networks["actor"]
+            obs = T.zeros(actor.gsp_network_input, dtype=T.float32).to(gsp_net.device)
+            with T.no_grad():
+                pred = gsp_net(obs)
+            pred_w = int(np.asarray(pred.cpu()).ravel().shape[0])
+            assert pred_w == gsp_slot, (
+                f"K={K}: head prediction width {pred_w} != actor slot {gsp_slot}"
+            )
