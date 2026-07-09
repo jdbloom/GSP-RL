@@ -156,6 +156,105 @@ class RunningStandardizer:
         return out.astype(np.float32, copy=False)
 
 
+def actor_gsp_feature_weight_diag(weight, n_obs: int, k: int) -> dict:
+    """Measure how strongly the actor's first linear layer weights the spliced
+    GSP prediction feature relative to a typical observation dimension.
+
+    This is the headline causal-usage diagnostic for the E2E GSP investigation:
+    the GSP prediction is well-learned but the causal ablation is null (the actor
+    appears to ignore it). If the actor is genuinely relying on the spliced
+    feature, the L2 norm of the first-layer weight COLUMNS feeding that feature
+    should grow (and its per-dim ratio to the obs columns move away from ~0). If
+    the actor ignores it, those columns stay near their init magnitude and the
+    ratio stays flat/small.
+
+    Layout contract
+    ---------------
+    The actor input is ``[obs (n_obs) | gsp (k)]`` so the first-layer weight
+    ``W`` has shape ``(hidden, n_obs + k)``. The GSP prediction feeds the LAST
+    ``k`` columns ``W[:, n_obs:]``; the obs feeds ``W[:, :n_obs]``.
+
+    Parameters
+    ----------
+    weight : torch.Tensor or array-like
+        First linear layer weight, shape ``(hidden, n_obs + k)`` (e.g. the DDQN
+        Q-net ``fc1.weight`` or the TD3 actor ``fc1.weight``). Detached
+        internally; no autograd edge is created.
+    n_obs : int
+        Number of raw observation input dims (columns ``[0, n_obs)``).
+    k : int
+        Width of the spliced GSP feature (columns ``[n_obs, n_obs + k)``).
+
+    Returns
+    -------
+    dict with keys:
+        ``actor_gsp_feature_weight_norm`` : float
+            Frobenius norm of the GSP columns ``||W[:, n_obs:]||_F``.
+        ``actor_obs_weight_norm_mean`` : float
+            Mean over the obs columns of the per-column L2 norm
+            ``mean_j ||W[:, j]||_2`` for ``j < n_obs``. A per-dim baseline.
+        ``actor_gsp_weight_ratio`` : float
+            Per-dim GSP-vs-obs reliance:
+            ``mean_gsp_column_norm / actor_obs_weight_norm_mean`` where
+            ``mean_gsp_column_norm = mean_j ||W[:, j]||_2`` for
+            ``n_obs <= j < n_obs + k``. This puts the GSP columns and the obs
+            columns on the SAME per-dimension footing regardless of ``k`` (for
+            ``k == 1`` it equals ``gsp_col_norm / obs_col_norm``). ``~0`` → the
+            actor ignores the prediction; growing → it relies on it.
+
+    Notes
+    -----
+    Pure read of the weight values — no gradient, no in-place mutation. Callable
+    under ``torch.no_grad()`` at the call site; also detaches defensively so a
+    graph-carrying weight cannot leak an autograd edge into the diagnostics.
+    """
+    n_obs = int(n_obs)
+    k = int(k)
+    if n_obs < 0 or k < 1:
+        raise ValueError(f"actor_gsp_feature_weight_diag needs n_obs>=0, k>=1; got n_obs={n_obs}, k={k}")
+    if _is_torch(weight):
+        import torch as T
+
+        with T.no_grad():
+            w = weight.detach()
+            if w.dim() != 2 or w.shape[1] != n_obs + k:
+                raise ValueError(
+                    f"weight shape {tuple(w.shape)} incompatible with "
+                    f"n_obs+k={n_obs + k} (expected (hidden, {n_obs + k}))"
+                )
+            col_norms = T.linalg.vector_norm(w, dim=0)  # per-column L2, shape (n_obs+k,)
+            gsp_cols = col_norms[n_obs:]
+            obs_cols = col_norms[:n_obs]
+            gsp_feature_weight_norm = float(T.linalg.vector_norm(gsp_cols).item())
+            obs_weight_norm_mean = (
+                float(obs_cols.mean().item()) if n_obs > 0 else 0.0
+            )
+            mean_gsp_col_norm = float(gsp_cols.mean().item())
+    else:
+        w = np.asarray(weight, dtype=np.float64)
+        if w.ndim != 2 or w.shape[1] != n_obs + k:
+            raise ValueError(
+                f"weight shape {tuple(w.shape)} incompatible with "
+                f"n_obs+k={n_obs + k} (expected (hidden, {n_obs + k}))"
+            )
+        col_norms = np.linalg.norm(w, axis=0)
+        gsp_cols = col_norms[n_obs:]
+        obs_cols = col_norms[:n_obs]
+        gsp_feature_weight_norm = float(np.linalg.norm(gsp_cols))
+        obs_weight_norm_mean = float(obs_cols.mean()) if n_obs > 0 else 0.0
+        mean_gsp_col_norm = float(gsp_cols.mean())
+    ratio = (
+        mean_gsp_col_norm / obs_weight_norm_mean
+        if obs_weight_norm_mean > 0.0
+        else 0.0
+    )
+    return {
+        "actor_gsp_feature_weight_norm": gsp_feature_weight_norm,
+        "actor_obs_weight_norm_mean": obs_weight_norm_mean,
+        "actor_gsp_weight_ratio": ratio,
+    }
+
+
 def _is_torch(x) -> bool:
     return type(x).__module__.startswith("torch")
 

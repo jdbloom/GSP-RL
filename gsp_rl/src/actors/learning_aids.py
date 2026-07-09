@@ -25,7 +25,10 @@ from gsp_rl.src.networks import (
     AttentionEncoder,
     simnorm,
 )
-from gsp_rl.src.actors.feature_stats import RunningStandardizer
+from gsp_rl.src.actors.feature_stats import (
+    RunningStandardizer,
+    actor_gsp_feature_weight_diag,
+)
 
 import torch as T
 import torch.nn as nn
@@ -1000,6 +1003,32 @@ class NetworkAids(Hyperparameters):
             }
         return diagnostics
 
+    def _actor_gsp_weight_diag(self, actor_net, k: int) -> dict:
+        """Compute the actor-GSP-feature reliance diagnostic for ``actor_net``.
+
+        Reads the first linear layer weight (``fc1.weight``, shape
+        ``(hidden, N_obs + K)``) of the network that consumes the augmented
+        ``[obs | gsp]`` state (the DDQN Q-net or the TD3 actor). ``N_obs`` is
+        ``self.input_size`` (the raw egocentric obs width) and ``K`` is the GSP
+        slot width (``gsp_network_output``, passed in as ``k``). Returns the
+        three ``actor_gsp_*`` reliance metrics.
+
+        Pure read under no_grad; on any structural mismatch (unexpected layer
+        name / shape) returns NaNs rather than perturbing or crashing training —
+        this is a diagnostic, it must never gate the learn step.
+        """
+        n_obs = int(getattr(self, 'input_size'))
+        first = getattr(actor_net, 'fc1', None)
+        weight = getattr(first, 'weight', None)
+        if weight is None or weight.dim() != 2 or weight.shape[1] != n_obs + int(k):
+            nan = float('nan')
+            return {
+                'actor_gsp_feature_weight_norm': nan,
+                'actor_obs_weight_norm_mean': nan,
+                'actor_gsp_weight_ratio': nan,
+            }
+        return actor_gsp_feature_weight_diag(weight, n_obs, int(k))
+
     def learn_DDQN_e2e(self, networks, gsp_networks):
         """End-to-end joint training of DDQN + GSP head.
 
@@ -1092,9 +1121,17 @@ class NetworkAids(Hyperparameters):
         # stats (BatchNorm-style running estimate). Update uses the pre-standardized
         # slot representation (post-scale, matching the acting slot). Grad flows
         # through standardize (mean/std enter as constants). None → no-op.
+        # Diagnostic: std of the spliced feature BEFORE / AFTER the NORMALIZE_FEATURE
+        # standardization, to confirm the standardizer is actually rescaling the
+        # feature. Read-only, under no_grad — never enters the loss. When normalize
+        # is off (gsp_feature_stats is None) post == pre by construction.
+        with T.no_grad():
+            gsp_feature_std_prenorm = float(gsp_pred_actor.detach().std().item())
         if self.gsp_feature_stats is not None:
             gsp_pred_actor = self.gsp_feature_stats.standardize(gsp_pred_actor)
             self.gsp_feature_stats.update(gsp_pred.detach() * _GSP_ACTOR_SCALE)
+        with T.no_grad():
+            gsp_feature_std_postnorm = float(gsp_pred_actor.detach().std().item())
         gsp_idx = self.input_size
         augmented = T.cat(
             [states[:, :gsp_idx], gsp_pred_actor, states[:, gsp_idx + _gsp_slot:]],
@@ -1165,6 +1202,13 @@ class NetworkAids(Hyperparameters):
         networks['learn_step_counter'] += 1
         self.decrement_epsilon()
 
+        # Actor GSP-feature reliance diagnostic (the headline causal-usage metric).
+        # The augmented state feeds the DDQN Q-net, whose first layer fc1.weight has
+        # shape (hidden, input_size + K). The GSP feature occupies the LAST K columns.
+        # Pure read of the post-step weights under no_grad — no autograd edge, no
+        # perturbation of the net. See feature_stats.actor_gsp_feature_weight_diag.
+        weight_diag = self._actor_gsp_weight_diag(networks['q_eval'], _gsp_slot)
+
         return {
             'ddqn_loss': ddqn_loss.item(),
             'gsp_mse_loss': gsp_mse_loss.item(),
@@ -1177,6 +1221,9 @@ class NetworkAids(Hyperparameters):
             'gsp_pred_std': float(gsp_pred.detach().std().item()),
             'gsp_label_mean': float(gsp_labels.detach().mean().item()),
             'gsp_label_std': float(gsp_labels.detach().std().item()),
+            'gsp_feature_std_prenorm': gsp_feature_std_prenorm,
+            'gsp_feature_std_postnorm': gsp_feature_std_postnorm,
+            **weight_diag,
         }
 
     def learn_DDQN_jepa_coupled(self, networks, gsp_networks):
@@ -1627,9 +1674,16 @@ class NetworkAids(Hyperparameters):
         # stats, then fold this batch in (BatchNorm-style running estimate). Update
         # uses the post-scale slot representation, matching the acting slot. Grad
         # flows through standardize (mean/std are constants). None → no-op.
+        # Diagnostic: std of the spliced feature BEFORE / AFTER standardization
+        # (confirms the standardizer rescales it). Read-only, under no_grad; when
+        # normalize is off post == pre by construction. Mirrors learn_DDQN_e2e.
+        with T.no_grad():
+            gsp_feature_std_prenorm = float(gsp_pred_actor.detach().std().item())
         if self.gsp_feature_stats is not None:
             gsp_pred_actor = self.gsp_feature_stats.standardize(gsp_pred_actor)
             self.gsp_feature_stats.update(gsp_pred.detach() * _GSP_ACTOR_SCALE)
+        with T.no_grad():
+            gsp_feature_std_postnorm = float(gsp_pred_actor.detach().std().item())
         gsp_idx = self.input_size
         augmented = T.cat(
             [states[:, :gsp_idx], gsp_pred_actor, states[:, gsp_idx + _gsp_slot:]],
@@ -1705,6 +1759,12 @@ class NetworkAids(Hyperparameters):
 
         networks['learn_step_counter'] += 1
 
+        # Actor GSP-feature reliance diagnostic (headline causal-usage metric).
+        # In TD3 the spliced feature feeds the actor (and critics); the actor's
+        # first layer fc1.weight is (hidden, input_size + K), GSP in the LAST K
+        # columns. Pure read of the actor weights under no_grad — no perturbation.
+        weight_diag = self._actor_gsp_weight_diag(networks['actor'], _gsp_slot)
+
         diagnostics = {
             'critic_loss': critic_loss.item(),
             'actor_loss': None,
@@ -1716,6 +1776,9 @@ class NetworkAids(Hyperparameters):
             'gsp_pred_std': float(gsp_pred.detach().std().item()),
             'gsp_label_mean': float(gsp_labels.detach().mean().item()),
             'gsp_label_std': float(gsp_labels.detach().std().item()),
+            'gsp_feature_std_prenorm': gsp_feature_std_prenorm,
+            'gsp_feature_std_postnorm': gsp_feature_std_postnorm,
+            **weight_diag,
         }
 
         # --- 7. Delayed actor update (mirrors learn_TD3) ---
