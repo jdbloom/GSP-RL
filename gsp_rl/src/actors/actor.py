@@ -23,6 +23,7 @@ from gsp_rl.src.buffers import(
     AttentionSequenceReplayBuffer
 )
 from gsp_rl.src.actors.learning_aids import NetworkAids
+from gsp_rl.src.actors.feature_stats import RunningStandardizer
 from gsp_rl.src.networks.jepa import JEPAEncoder, JEPAPredictor
 
 
@@ -104,6 +105,17 @@ class Actor(NetworkAids):
         self.gsp_min_max_action = gsp_min_max_action
         self.gsp_look_back = gsp_look_back
         self.gsp_sequence_length = gsp_sequence_length
+
+        # GSP_E2E_NORMALIZE_FEATURE (opt-in): now that the feature width K
+        # (gsp_network_output) is resolved, build the shared RunningStandardizer.
+        # NetworkAids.__init__ parsed the flag and left gsp_feature_stats=None (it
+        # runs before gsp_network_output is known). ONE instance is shared by the
+        # acting splice (RL-CT Agent.make_agent_state) and the learn splices
+        # (learn_DDQN_e2e / learn_TD3_e2e) through this same self. Flag off → stays
+        # None → both splices byte-identical to today.
+        if getattr(self, 'gsp_e2e_normalize_feature', False):
+            _feat_dim = int(self.gsp_network_output or 1)
+            self.gsp_feature_stats = RunningStandardizer(dim=_feat_dim)
 
         # Task 0 ablation knobs for the GSP head. Defaults preserve legacy behavior.
         # Read from the agent_config.yml so experiments can flip these per-job.

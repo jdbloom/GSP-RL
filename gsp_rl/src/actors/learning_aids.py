@@ -25,6 +25,8 @@ from gsp_rl.src.networks import (
     AttentionEncoder,
     simnorm,
 )
+from gsp_rl.src.actors.feature_stats import RunningStandardizer
+
 import torch as T
 import torch.nn as nn
 import torch.nn.functional as F
@@ -320,6 +322,30 @@ class Hyperparameters:
         self.gsp_e2e_stop_grad_feature = bool(
             config.get('GSP_E2E_STOP_GRAD_FEATURE', False)
         )
+
+        # GSP_E2E_NORMALIZE_FEATURE (default False): standardize the spliced GSP
+        # prediction to ~unit variance at the point it is concatenated into the
+        # actor's Q-input. Motivation: the raw spliced scalar (std ~0.024) sits
+        # among O(1) egocentric obs; ACTOR_USE_LAYER_NORM normalizes the whole
+        # 32-vector (not per-feature), so the actor cannot learn to weight a
+        # feature that small — the frozen_mean causal ablation was NULL at n=100.
+        # When True, a single RunningStandardizer instance (self.gsp_feature_stats)
+        # is shared between the acting splice (RL-CT agent.make_agent_state) and the
+        # learn splices (learn_DDQN_e2e / learn_TD3_e2e): stats update ONLY during
+        # learning, acting reads frozen stats. RL-CT's Agent subclasses this Actor,
+        # so the same per-robot instance owns both paths — guaranteeing identical
+        # standardization. Default False leaves gsp_feature_stats = None and every
+        # splice byte-identical to today. See gsp_rl/src/actors/feature_stats.py.
+        # NOTE: gsp_network_output is not known yet here (Actor.__init__ sets it
+        # AFTER this settings super().__init__ returns), so the RunningStandardizer
+        # instance is constructed in Actor.__init__ once the feature width (K) is
+        # resolved. This block only parses the flag. Default False.
+        self.gsp_e2e_normalize_feature = bool(
+            config.get('GSP_E2E_NORMALIZE_FEATURE', False)
+        )
+        # Placeholder; Actor.__init__ overwrites with a RunningStandardizer(dim=K)
+        # when the flag is on. Stays None when off → every splice byte-identical.
+        self.gsp_feature_stats = None
 
         # H-13 closure: LayerNorm in the main DQN/DDQN action network's trunk.
         # Independent of GSP_USE_LAYER_NORM (which only affects the GSP head).
@@ -1050,12 +1076,25 @@ class NetworkAids(Hyperparameters):
             _GSP_ACTOR_SCALE = float(np.degrees(1.0) / 10.0)  # == degrees(x/10)/x
             gsp_pred_actor = gsp_pred * _GSP_ACTOR_SCALE
         else:
+            _GSP_ACTOR_SCALE = 1.0
             gsp_pred_actor = gsp_pred
         # GSP_E2E_STOP_GRAD_FEATURE: sever the actor's TD gradient at the splice so
         # it cannot perturb the head. The supervised MSE below still uses the RAW,
         # un-detached gsp_pred, so the head keeps learning to predict.
         if self.gsp_e2e_stop_grad_feature:
             gsp_pred_actor = gsp_pred_actor.detach()
+        # GSP_E2E_NORMALIZE_FEATURE (opt-in): standardize the spliced feature to
+        # ~unit variance so it is on the scale of the O(1) egocentric obs. This is
+        # the SAME shared RunningStandardizer the acting splice
+        # (agent.make_agent_state) reads — identical stats on both sides. Standardize
+        # with the CURRENT (frozen) stats first, THEN fold this batch in, so the
+        # value the critic sees here matches what acting saw with the pre-batch
+        # stats (BatchNorm-style running estimate). Update uses the pre-standardized
+        # slot representation (post-scale, matching the acting slot). Grad flows
+        # through standardize (mean/std enter as constants). None → no-op.
+        if self.gsp_feature_stats is not None:
+            gsp_pred_actor = self.gsp_feature_stats.standardize(gsp_pred_actor)
+            self.gsp_feature_stats.update(gsp_pred.detach() * _GSP_ACTOR_SCALE)
         gsp_idx = self.input_size
         augmented = T.cat(
             [states[:, :gsp_idx], gsp_pred_actor, states[:, gsp_idx + _gsp_slot:]],
@@ -1582,6 +1621,15 @@ class NetworkAids(Hyperparameters):
             gsp_pred_actor = gsp_pred
         if self.gsp_e2e_stop_grad_feature:
             gsp_pred_actor = gsp_pred_actor.detach()
+        # GSP_E2E_NORMALIZE_FEATURE (opt-in): standardize the spliced feature to
+        # ~unit variance using the SAME shared RunningStandardizer the acting splice
+        # (agent.make_agent_state) reads. Standardize with the current (frozen)
+        # stats, then fold this batch in (BatchNorm-style running estimate). Update
+        # uses the post-scale slot representation, matching the acting slot. Grad
+        # flows through standardize (mean/std are constants). None → no-op.
+        if self.gsp_feature_stats is not None:
+            gsp_pred_actor = self.gsp_feature_stats.standardize(gsp_pred_actor)
+            self.gsp_feature_stats.update(gsp_pred.detach() * _GSP_ACTOR_SCALE)
         gsp_idx = self.input_size
         augmented = T.cat(
             [states[:, :gsp_idx], gsp_pred_actor, states[:, gsp_idx + _gsp_slot:]],
