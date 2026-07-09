@@ -387,7 +387,13 @@ class Actor(NetworkAids):
             # returns only 5 values and the e2e unpack fails at runtime.
             _needs_gsp_obs = self.gsp_e2e_enabled
             gsp_obs_sz = self.gsp_network_input if _needs_gsp_obs else 0
-            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, self.output_size, 'Continuous', gsp_obs_size=gsp_obs_sz, recency_halflife=self.recency_halflife)
+            # E2E label width == head output width (K, or 2K for
+            # cyl_displacement_traj) — see the DQN branch above. Previously this
+            # path omitted gsp_label_size (default 1), which broadcast-crashed any
+            # vector-label E2E target on TD3. Legacy scalar target -> width 1,
+            # byte-identical.
+            gsp_label_sz = int(self.gsp_network_output) if self.gsp_e2e_enabled else 1
+            self.networks['replay'] = ReplayBuffer(self.mem_size, self.network_input_size, self.output_size, 'Continuous', gsp_obs_size=gsp_obs_sz, recency_halflife=self.recency_halflife, gsp_label_size=gsp_label_sz)
             self.networks['output_size'] = self.output_size
             self.networks['learn_step_counter'] = 0
         else:
