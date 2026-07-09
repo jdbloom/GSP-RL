@@ -453,6 +453,25 @@ class Hyperparameters:
         #                                            O = GSP_PREDICTION_HORIZON. At K=1 it
         #                                            reduces to the legacy single-step
         #                                            rotation (2026-07-05).
+        #   'goal_progress_traj'              O=K  — GLOBAL payload progress-to-goal
+        #                                            TRAJECTORY over the next K steps:
+        #                                            per-step delta of the payload's
+        #                                            distance-to-goal (prev - curr,
+        #                                            positive = toward goal — the exact
+        #                                            quantity from cyl_kinematics_goal_4d's
+        #                                            4th component), as a K-vector via
+        #                                            the same delayed FIFO as
+        #                                            delta_theta_traj. Labels are RAW
+        #                                            meters — no magic scaling; lambda is
+        #                                            set from measured label std (F15).
+        #                                            O = GSP_PREDICTION_HORIZON (2026-07-09).
+        #   'cyl_displacement_traj'           O=2K — GLOBAL payload displacement
+        #                                            TRAJECTORY over the next K steps:
+        #                                            per-step payload (Δx, Δy), flattened
+        #                                            [Δx1,Δy1,…,ΔxK,ΔyK]. Same delayed
+        #                                            FIFO, vector entries. RAW meters.
+        #                                            O = 2 * GSP_PREDICTION_HORIZON
+        #                                            (2026-07-09).
         #
         # gsp_output_size_effective is the O to use when building the GSP head.
         # The legacy gsp_output_size kwarg (from config['GSP_OUTPUT_SIZE']) is kept
@@ -460,7 +479,8 @@ class Hyperparameters:
         # when GSP_OUTPUT_KIND is set to a non-default value.
         #
         # A dict value of None marks a HORIZON-COUPLED kind whose output dim is not a
-        # fixed constant but equals GSP_PREDICTION_HORIZON. It is resolved from the
+        # fixed constant but scales with GSP_PREDICTION_HORIZON (K) by the per-kind
+        # multiplier in _GSP_TRAJ_KIND_HORIZON_MULTIPLIER. It is resolved from the
         # SAME config key that the RL-CollectiveTransport host (agent.py) uses to size
         # the actor/neighbor input, so head output width and input width always agree.
         _GSP_OUTPUT_KIND_SIZES = {
@@ -470,8 +490,23 @@ class Hyperparameters:
             'cyl_kinematics_goal_4d': 4,
             'time_to_goal_1d': 1,
             'neighbor_force_1d': 1,
-            'delta_theta_traj': None,  # size == K == GSP_PREDICTION_HORIZON
+            'delta_theta_traj': None,       # size == K == GSP_PREDICTION_HORIZON
+            'goal_progress_traj': None,     # size == K
+            'cyl_displacement_traj': None,  # size == 2K (per-step Δx,Δy pairs)
         }
+        # Horizon multiplier per horizon-coupled kind: output dim == mult * K.
+        # cyl_displacement_traj packs (Δx, Δy) per step, hence 2 entries per step.
+        _GSP_TRAJ_KIND_HORIZON_MULTIPLIER = {
+            'delta_theta_traj': 1,
+            'goal_progress_traj': 1,
+            'cyl_displacement_traj': 2,
+        }
+        # The trajectory PREDICTION TARGETS (host-side delayed-FIFO labels) whose
+        # names double as their required GSP_OUTPUT_KIND. Kept in lockstep with
+        # RL-CollectiveTransport agent.py (_GSP_TRAJ_TARGETS) and Main.py.
+        _GSP_TRAJ_TARGETS = (
+            'delta_theta_traj', 'goal_progress_traj', 'cyl_displacement_traj'
+        )
         self.gsp_output_kind = str(config.get('GSP_OUTPUT_KIND', 'delta_theta_1d'))
         if self.gsp_output_kind not in _GSP_OUTPUT_KIND_SIZES:
             raise ValueError(
@@ -481,32 +516,37 @@ class Hyperparameters:
         # Keep GSP_OUTPUT_KIND consistent with GSP_PREDICTION_TARGET. The host
         # (RL-CollectiveTransport agent.py) emits the label whose width is fixed
         # by the TARGET, while the head/buffer width here is fixed by the KIND.
-        # For 'delta_theta_traj' the label is a size-K vector but the default kind
-        # 'delta_theta_1d' is scalar (O=1) — a mismatch that does NOT fail at
-        # config time but crashes ~mid-episode deep in the replay buffer with
-        # `could not broadcast (K,) into (1,)` (observed 2026-07-08, the dtraj
-        # arm). The output dim is fully determined by the target, so auto-derive
-        # the kind when it was left at the scalar default, and reject an explicit
-        # contradiction loudly. (O=1 targets like future_prox are dimensionally
-        # safe either way; this guards the horizon-coupled trajectory target.)
-        if self.gsp_prediction_target == 'delta_theta_traj':
+        # For the trajectory targets the label is a size-(mult*K) vector but the
+        # default kind 'delta_theta_1d' is scalar (O=1) — a mismatch that does NOT
+        # fail at config time but crashes ~mid-episode deep in the replay buffer
+        # with `could not broadcast (K,) into (1,)` (observed 2026-07-08, the
+        # dtraj arm). The output dim is fully determined by the target, so
+        # auto-derive the kind when it was left at the scalar default, and reject
+        # an explicit contradiction loudly. (O=1 targets like future_prox are
+        # dimensionally safe either way; this guards the horizon-coupled
+        # trajectory targets.)
+        if self.gsp_prediction_target in _GSP_TRAJ_TARGETS:
             if self.gsp_output_kind == 'delta_theta_1d':
-                self.gsp_output_kind = 'delta_theta_traj'
-            elif self.gsp_output_kind != 'delta_theta_traj':
+                self.gsp_output_kind = self.gsp_prediction_target
+            elif self.gsp_output_kind != self.gsp_prediction_target:
                 raise ValueError(
-                    "GSP_PREDICTION_TARGET='delta_theta_traj' requires "
-                    "GSP_OUTPUT_KIND='delta_theta_traj' (the size-K trajectory "
+                    f"GSP_PREDICTION_TARGET='{self.gsp_prediction_target}' requires "
+                    f"GSP_OUTPUT_KIND='{self.gsp_prediction_target}' (the size-K "
+                    "trajectory "
                     f"output); got GSP_OUTPUT_KIND='{self.gsp_output_kind}'."
                 )
         _kind_size = _GSP_OUTPUT_KIND_SIZES[self.gsp_output_kind]
         if _kind_size is None:
-            # Horizon-coupled kind: output dim == GSP_PREDICTION_HORIZON.
-            _kind_size = int(self.gsp_prediction_horizon)
-            if _kind_size < 1:
+            # Horizon-coupled kind: output dim == multiplier * GSP_PREDICTION_HORIZON.
+            _horizon = int(self.gsp_prediction_horizon)
+            if _horizon < 1:
                 raise ValueError(
                     f"GSP_OUTPUT_KIND='{self.gsp_output_kind}' requires "
-                    f"GSP_PREDICTION_HORIZON >= 1, got {_kind_size}"
+                    f"GSP_PREDICTION_HORIZON >= 1, got {_horizon}"
                 )
+            _kind_size = (
+                _GSP_TRAJ_KIND_HORIZON_MULTIPLIER[self.gsp_output_kind] * _horizon
+            )
         self.gsp_output_size_effective = _kind_size
 
         # Weight initialization scheme for the GSP head's hidden layers.
