@@ -619,9 +619,32 @@ class Actor(NetworkAids):
         Only supports stateless action networks (DQN, DDQN, DDPG, TD3).
         Does NOT support RDDPG or attention — those have state/memory concerns.
 
+        #53 Sub-project B call-site contract (BATCHED_ACTOR_FORWARD): the host
+        (RL-CollectiveTransport) routes its per-robot acting loop and the
+        stateless DDPG-scheme GSP-head prediction loop through this method —
+        one stacked (R, D) forward through the shared CTDE net instead of R
+        sequential (D,) forwards — ONLY when the opt-in BATCHED_ACTOR_FORWARD
+        flag is set (default False = the byte-identical sequential
+        choose_action path). This path is BASELINE-CHANGING, not inert:
+          - float-reduction order differs (batched vs per-row matmul), so
+            outputs match sequential only within fp tolerance (~1e-6); on a
+            near-tie the DQN/DDQN argmax can flip;
+          - the R per-robot epsilon-greedy gate draws collapse to ONE
+            np.random.random() draw per step (all-explore or all-exploit);
+          - DDPG exploration noise is drawn as one (R, K) T.normal instead of
+            R sequential (1, K) draws (same count, different stream order).
+        Activation is gated on the pre-registered n-seed noise-floor
+        re-baseline (docs/superpowers/specs/2026-06-30-training-loop-
+        optimization-design.md §7).
+
+        Works for the GSP prediction head too: pass self.gsp_networks (the
+        stateless 'DDPG' scheme built by build_DDPG_gsp, any output width K);
+        clamping intentionally uses self.min_max_action — the same bound the
+        sequential choose_action applies to gsp_networks today.
+
         Args:
             observations: list of observation arrays, one per agent.
-            networks: network dict (self.networks).
+            networks: network dict (self.networks or stateless self.gsp_networks).
             test: if True, greedy (no exploration noise/epsilon).
 
         Returns:
