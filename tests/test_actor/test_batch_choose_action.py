@@ -59,6 +59,37 @@ class TestDDQNBatch:
 
         assert sequential == batched
 
+    def test_exploiting_step_consumes_single_gate_draw_and_goes_greedy(self, config):
+        """0 < epsilon < 1, a seed whose gate draw EXPLOITS: exactly ONE
+        np.random.random() gate draw, ZERO np.random.choice draws, then the
+        batched greedy actions — the exploit-branch RNG contract, pinned via
+        np.random state equality."""
+        config["EPSILON"] = 0.5
+        actor = Actor(id=1, config=config, network="DDQN",
+                      input_size=8, output_size=4, min_max_action=1, meta_param_size=1)
+        rng = np.random.default_rng(7)
+        observations = [rng.standard_normal(8).astype(np.float32) for _ in range(4)]
+
+        # Greedy reference: the test=True path never touches np.random.
+        greedy = actor.choose_actions_batch(observations, actor.networks, test=True)
+
+        np.random.seed(0)  # first np.random.random() = 0.5488... > 0.5
+        batched = actor.choose_actions_batch(observations, actor.networks, test=False)
+        state_after = np.random.get_state()
+
+        np.random.seed(0)
+        gate = np.random.random()
+        assert gate > actor.epsilon  # seed sanity: this seed exploits
+        expected_state = np.random.get_state()
+
+        # Exploiting step returns the batched greedy actions...
+        assert batched == greedy
+        # ...and leaves np.random exactly one gate draw ahead: no
+        # np.random.choice was consumed anywhere in the call.
+        assert state_after[0] == expected_state[0]
+        np.testing.assert_array_equal(state_after[1], expected_state[1])
+        assert state_after[2:] == expected_state[2:]
+
 
 class TestDDPGBatch:
     def test_batch_matches_sequential(self, config):
