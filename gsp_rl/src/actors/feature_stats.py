@@ -45,12 +45,12 @@ permanently inflate the running std, so the post-norm feature std reached only
 0.17-0.39 instead of ~1.0 — the standardizer silently re-shrank the feature it
 exists to normalize. In EMA mode the stats are a bias-corrected exponential
 moving average (Adam-style) over UPDATE calls (i.e. learn steps, not samples):
-per update ``t`` with batch mean ``m_t`` and batch raw second moment ``s_t``,
+per update ``t`` with batch mean ``m_t`` and WITHIN-batch variance ``v_t``,
 
     ema_mean_t = beta * ema_mean_{t-1} + (1 - beta) * m_t
-    ema_sq_t   = beta * ema_sq_{t-1}   + (1 - beta) * s_t
+    ema_var_t  = beta * ema_var_{t-1}  + (1 - beta) * v_t
     mean = ema_mean_t / (1 - beta^t)
-    var  = max(ema_sq_t / (1 - beta^t) - mean^2, 0)
+    var  = ema_var_t  / (1 - beta^t)
 
 with ``beta = 0.5 ** (1 / ema_halflife)`` so a batch's weight halves every
 ``ema_halflife`` updates. The bias correction ``1 / (1 - beta^t)`` makes the
@@ -60,6 +60,20 @@ approximate a near-uniform average of the batches seen so far — no separate
 Welford warmup phase is needed. The ``count == 0`` identity behavior is
 unchanged. ``ema_halflife == 0`` (the default) leaves the legacy Welford path
 byte-identical for existing runs.
+
+Why WITHIN-batch variance, not ``E[x^2] - E[x]^2`` (2026-07-09, second measured
+failure): learn batches are i.i.d. replay samples, but under a fast-moving head
+(high lambda) the per-batch MEAN drifts at label scale across the EMA window.
+A raw-second-moment variance estimate then equals ``within-batch variance +
+drift variance of the batch means`` — measured live (cdt-ema cells, 39k learn
+steps, far past the halflife) the drift term dominated ~100x, so post-norm std
+sat at 0.05-0.16 with no recovery possible (within-batch std can never exceed
+label std, which was itself below the drift-inflated estimate). What the actor
+needs is unit dispersion ACROSS STATES at a fixed time — exactly the
+within-batch variance — so EMA mode scales by the EMA of within-batch variance
+and is immune to mean drift by construction. Centering still uses the EMA mean:
+a drifting mean leaves only a slowly-varying common-mode offset in the spliced
+feature, which is action-invariant (value-offset) and harmless.
 """
 
 from __future__ import annotations
@@ -74,8 +88,14 @@ class RunningStandardizer:
     ----------
     dim : int
         Feature width (K). One (mean, M2) pair is tracked per dimension.
-    eps : float
-        Variance floor added under the sqrt for numerical stability.
+    eps : float or None
+        Variance floor added under the sqrt for numerical stability. None
+        (default) resolves per mode: 1e-5 in Welford mode (legacy
+        byte-identity) and 1e-12 in EMA mode. The 1e-5 floor is calibrated for
+        O(1) features; measured live (2026-07-09, cdt-ema cells) it swamped a
+        meter-scale feature whose within-batch variance was 2.5e-7, capping the
+        post-norm std at ~0.16 no matter how good the variance estimate was.
+        1e-12 (std floor 1e-6) is a pure numerical guard.
     ema_halflife : float
         Exponential-moving-average half-life in UPDATE counts (learn steps).
         0 (default) = legacy all-history Welford, byte-identical to prior runs.
@@ -86,15 +106,21 @@ class RunningStandardizer:
 
     __slots__ = (
         "dim", "eps", "count", "_mean", "_m2",
-        "ema_halflife", "_beta", "_updates", "_ema_mean", "_ema_sq",
+        "ema_halflife", "_beta", "_updates", "_ema_mean", "_ema_var",
     )
 
     def __init__(
-        self, dim: int, eps: float = 1e-5, ema_halflife: float = 0.0
+        self, dim: int, eps: float | None = None, ema_halflife: float = 0.0
     ) -> None:
         if dim < 1:
             raise ValueError(f"RunningStandardizer dim must be >= 1, got {dim}")
         self.dim = int(dim)
+        if eps is None:
+            # Mode-resolved default: Welford keeps the legacy 1e-5 floor
+            # byte-identical; EMA mode uses a pure numerical guard so
+            # tiny-variance (e.g. meter-scale) features are not re-shrunk by
+            # the floor itself (see class docstring).
+            eps = 1e-5 if float(ema_halflife) == 0.0 else 1e-12
         self.eps = float(eps)
         self.count: int = 0
         self._mean = np.zeros(self.dim, dtype=np.float64)
@@ -112,7 +138,7 @@ class RunningStandardizer:
         )
         self._updates: int = 0
         self._ema_mean = np.zeros(self.dim, dtype=np.float64)
-        self._ema_sq = np.zeros(self.dim, dtype=np.float64)
+        self._ema_var = np.zeros(self.dim, dtype=np.float64)
 
     # --- read-only views of the current (frozen) stats ---
     @property
@@ -133,15 +159,15 @@ class RunningStandardizer:
 
         Welford mode: zeros before any update and while count < 2 (a single
         sample has no variance); ``standardize`` then divides by sqrt(eps) only.
-        EMA mode: ``E_ema[x^2] - E_ema[x]^2`` with bias-corrected moments,
-        clipped at 0 against floating-point cancellation.
+        EMA mode: bias-corrected EMA of the WITHIN-batch (cross-state) variance
+        — deliberately excludes drift of the batch means over time (see module
+        docstring).
         """
         if self.ema_halflife > 0:
             if self._updates == 0:
                 return np.zeros(self.dim, dtype=np.float64)
             corr = 1.0 - self._beta ** self._updates
-            mean_hat = self._ema_mean / corr
-            return np.maximum(self._ema_sq / corr - mean_hat ** 2, 0.0)
+            return self._ema_var / corr
         if self.count < 2:
             return np.zeros(self.dim, dtype=np.float64)
         return self._m2 / self.count
@@ -178,15 +204,19 @@ class RunningStandardizer:
             return
         mean_b = arr.mean(axis=0)
         if self.ema_halflife > 0:
-            # EMA mode: fold this update's batch mean and raw second moment into
-            # the (bias-corrected) exponential moving averages. The half-life
-            # clock ticks once per UPDATE call (learn step), independent of the
-            # batch size; ``count`` still counts samples so the ``count == 0``
-            # identity and the learn-splice count contract are unchanged.
+            # EMA mode: fold this update's batch mean and WITHIN-batch variance
+            # into the (bias-corrected) exponential moving averages. Scaling by
+            # within-batch variance (not E[x^2]-E[x]^2) keeps the std estimate
+            # immune to drift of the batch means under a fast-moving head — the
+            # measured 100x inflation at lambda=40k (see module docstring). The
+            # half-life clock ticks once per UPDATE call (learn step),
+            # independent of the batch size; ``count`` still counts samples so
+            # the ``count == 0`` identity and the learn-splice count contract
+            # are unchanged.
             self._updates += 1
             w = 1.0 - self._beta
             self._ema_mean = self._beta * self._ema_mean + w * mean_b
-            self._ema_sq = self._beta * self._ema_sq + w * (arr ** 2).mean(axis=0)
+            self._ema_var = self._beta * self._ema_var + w * arr.var(axis=0)
             self.count += n_b
             return
         # Chan et al. parallel/batch Welford: combine the running aggregate with

@@ -55,6 +55,26 @@ def test_ema_recovers_recent_regime_after_shift():
     assert abs(out.mean()) < 0.1
 
 
+def test_ema_immune_to_batch_mean_drift():
+    """The live cdt-ema failure (2026-07-09): under a fast-moving head the
+    per-batch mean drifts at label scale while the within-batch (cross-state)
+    std stays small. A raw-second-moment EMA variance absorbs the drift and
+    over-scales ~10x (post-norm std sat at 0.05-0.16 at 39k learn steps, far
+    past the halflife). The EMA variance must track ONLY within-batch
+    dispersion: a fresh batch at the current drift position standardizes to
+    ~unit std."""
+    rng = np.random.default_rng(13)
+    within_std = 5e-4                      # measured within-batch head-output std
+    ema = RunningStandardizer(dim=1, ema_halflife=HALFLIFE)
+    drift = 0.0
+    for _ in range(1000):
+        drift += rng.normal(0.0, 2.5e-3)   # mean drifts at label scale per step
+        ema.update(rng.normal(drift, within_std, size=(BATCH, 1)))
+    fresh = rng.normal(drift, within_std, size=(4096, 1))
+    out = ema.standardize(fresh)
+    assert out.std() == pytest.approx(1.0, abs=0.15)
+
+
 def test_legacy_welford_stays_inflated_after_shift():
     """The same stream through the legacy all-history Welford stays inflated:
     the early large-variance phase permanently dominates the running std, so
@@ -187,6 +207,16 @@ def test_ema_torch_and_numpy_paths_agree():
 def test_negative_halflife_raises():
     with pytest.raises(ValueError):
         RunningStandardizer(dim=1, ema_halflife=-1.0)
+
+
+def test_eps_default_resolves_per_mode():
+    """None eps resolves to the legacy 1e-5 floor in Welford mode (byte
+    identity for existing runs) and a pure numerical guard (1e-12) in EMA
+    mode, so tiny-variance meter-scale features are not re-shrunk by the
+    floor itself. An explicit eps always wins."""
+    assert RunningStandardizer(dim=1).eps == 1e-5
+    assert RunningStandardizer(dim=1, ema_halflife=100.0).eps == 1e-12
+    assert RunningStandardizer(dim=1, eps=1e-7, ema_halflife=100.0).eps == 1e-7
 
 
 # ---------------------------------------------------------------------------
