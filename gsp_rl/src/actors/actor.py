@@ -616,7 +616,9 @@ class Actor(NetworkAids):
     def choose_actions_batch(self, observations, networks, test=False):
         """Batched action selection for multiple observations in one forward pass.
 
-        Only supports stateless action networks (DQN, DDQN, DDPG, TD3).
+        Only supports stateless action networks (DQN, DDQN, DDPG, TD3 — but
+        see the TD3 caveat below: its batched semantics DIVERGE from
+        sequential beyond fp drift).
         Does NOT support RDDPG or attention — those have state/memory concerns.
 
         #53 Sub-project B call-site contract (BATCHED_ACTOR_FORWARD): the host
@@ -636,6 +638,18 @@ class Actor(NetworkAids):
         Activation is gated on the pre-registered n-seed noise-floor
         re-baseline (docs/superpowers/specs/2026-06-30-training-loop-
         optimization-design.md §7).
+
+        TD3 caveat — NOT covered by the float-drift-only equivalence claim
+        above. TD3 batched acting has DIFFERENT warmup/exploration SEMANTICS
+        vs the sequential loop, a semantic divergence rather than fp drift:
+        TD3_choose_action_batch advances self.time_step once per BATCH
+        instead of once per robot (R sequential calls advance it R times, so
+        the warmup phase ends R× sooner in env steps under batching), and it
+        draws np.random warmup/exploration noise in different shapes and
+        stream order (one (R, n_actions) np.random.normal draw vs R separate
+        per-robot draws). No host routes TD3 through this method today; any
+        future TD3 use requires its OWN equivalence work (warmup accounting +
+        RNG-contract tests + re-baseline) before activation.
 
         Works for the GSP prediction head too: pass self.gsp_networks (the
         stateless 'DDPG' scheme built by build_DDPG_gsp, any output width K);

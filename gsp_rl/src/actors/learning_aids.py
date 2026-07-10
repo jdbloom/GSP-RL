@@ -876,7 +876,23 @@ class NetworkAids(Hyperparameters):
         return networks['actor'].forward(states)
 
     def TD3_choose_action_batch(self, observations, networks, n_actions):
-        """Batched action selection for TD3. Returns list of (1, output_size) numpy arrays."""
+        """Batched action selection for TD3. Returns list of (1, output_size) numpy arrays.
+
+        SEMANTIC DIVERGENCE from sequential TD3_choose_action — not just fp
+        drift, so the #53-B float-drift-only equivalence claim
+        (choose_actions_batch docstring) does NOT cover TD3:
+          - self.time_step advances once per BATCH here vs once per ROBOT in
+            the sequential loop → under batching the warmup phase ends R×
+            sooner in env steps;
+          - warmup actions are one (R, n_actions) np.random.normal draw vs R
+            separate (n_actions,) draws, and exploration noise is one
+            mus-shaped draw vs R sequential scalar draws — different shapes
+            and stream order, so trajectories diverge whenever noise > 0 or
+            warmup > 0.
+        No host routes TD3 through the batched path today. Any future TD3 use
+        requires its own equivalence work (warmup accounting, RNG-contract
+        tests, re-baseline) before activation.
+        """
         if self.time_step < self.warmup:
             batch_size = len(observations)
             mus = T.tensor(np.random.normal(scale=self.noise, size=(batch_size, n_actions)),
