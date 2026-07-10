@@ -379,8 +379,12 @@ class Hyperparameters:
         # checkpoint, restore, or warm up — train/eval identical by
         # construction. Chosen from screen data, never adapted online. Applied
         # AFTER the (optional) standardizer so the two compose predictably.
+        _gain_raw = config.get('GSP_E2E_SPLICE_GAIN', 1.0)
+        # None (YAML null) degrades to the default; an explicit 0.0 is kept —
+        # it is a legitimate severing endpoint of a gain sweep, not a falsy
+        # accident to be remapped.
         self.gsp_e2e_splice_gain = float(
-            config.get('GSP_E2E_SPLICE_GAIN', 1.0) or 1.0
+            1.0 if _gain_raw is None else _gain_raw
         )
 
         # H-13 closure: LayerNorm in the main DQN/DDQN action network's trunk.
@@ -1885,6 +1889,17 @@ class NetworkAids(Hyperparameters):
         gsp_pred_actor_step = gsp_pred_actor_step * _GSP_ACTOR_SCALE
         if self.gsp_e2e_stop_grad_feature:
             gsp_pred_actor_step = gsp_pred_actor_step.detach()
+        # Mirror the critic-path slot pipeline exactly (standardize with the
+        # frozen stats, then the fixed splice gain): the actor's deterministic
+        # policy gradient must be computed on the SAME feature scale the critic
+        # was trained on and acting sees, or the policy is optimized on a state
+        # distribution it never encounters (review finding, 2026-07-10).
+        if self.gsp_feature_stats is not None:
+            gsp_pred_actor_step = self.gsp_feature_stats.standardize(
+                gsp_pred_actor_step
+            )
+        if self.gsp_e2e_splice_gain != 1.0:
+            gsp_pred_actor_step = gsp_pred_actor_step * self.gsp_e2e_splice_gain
         augmented_actor = T.cat(
             [states[:, :gsp_idx], gsp_pred_actor_step,
              states[:, gsp_idx + _gsp_slot:]],
