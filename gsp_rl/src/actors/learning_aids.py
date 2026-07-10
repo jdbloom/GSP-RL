@@ -387,6 +387,57 @@ class Hyperparameters:
             1.0 if _gain_raw is None else _gain_raw
         )
 
+        # GSP_E2E_UNIFIED_TARGET_ARITH (default False = byte-identical legacy,
+        # golden-tested): route learn_DDQN_e2e's Bellman target through the
+        # SAME _q_target arithmetic and critic-grad-clip treatment learn_DDQN
+        # uses. The legacy E2E path computes `rewards + gamma * bootstrap`
+        # directly — NO REWARD_SCALE, NO Q_TARGET_CLIP — and never calls
+        # _clip_critic_grad on q_eval (only the GSP head clips, at a hardcoded
+        # max_norm=1.0). Under the robust-training recipe (REWARD_SCALE 0.1,
+        # Q_TARGET_CLIP 1000, GRAD_CLIP_NORM 10) this trains IC arms
+        # (learn_DDQN) and GSP-N E2E arms under a 10x different effective
+        # reward scale with the stabilizers engaged on one side only — any
+        # penalty/reward arithmetic locked against _q_target (e.g. the
+        # 2026-07-10 obstacle-contact pre-reg) is wrong for every E2E arm.
+        # When True: target = _q_target(rewards, bootstrap) (reward_scale *
+        # rewards + gamma * bootstrap, then the Q_TARGET_CLIP clamp) and
+        # _clip_critic_grad(q_eval) after backward, exactly as learn_DDQN.
+        # Scope notes (verified 2026-07-10): learn_DDQN_jepa_coupled and
+        # learn_TD3_e2e ALREADY use _q_target/_clip_critic_grad (no bypass —
+        # the flag deliberately does not touch them), and CRITIC_LOSS already
+        # reaches the E2E loss via the DDQN net's own `loss` (actor.py threads
+        # critic_loss into nn_args), so the flag closes the remaining
+        # target-arithmetic + grad-clip gap only. The head-loss path (lambda *
+        # gsp_mse_loss) is untouched either way. Default False preserves the
+        # locked advantage-splice screen recipe and historical comparability.
+        self.gsp_e2e_unified_target_arith = bool(
+            config.get('GSP_E2E_UNIFIED_TARGET_ARITH', False)
+        )
+        # Fail-loud engaged-path assertion (one line per Actor construction,
+        # only where the flag governs anything, i.e. E2E runs): state the
+        # arithmetic the E2E TD target will actually use, with the stabilizer
+        # values as consumed — grep it before trusting any IC-vs-E2E
+        # comparison under a REWARD_SCALE recipe.
+        if self.gsp_e2e_enabled:
+            if self.gsp_e2e_unified_target_arith:
+                _learn_logger.info(
+                    "GSP_E2E_UNIFIED_TARGET_ARITH: ENGAGED — E2E Q-target = "
+                    "reward_scale(%s)*rewards + gamma(%s)*bootstrap, "
+                    "Q_TARGET_CLIP=%s, critic grad clip=%s (parity with "
+                    "learn_DDQN)",
+                    self.reward_scale, self.gamma, self.q_target_clip,
+                    self.grad_clip_norm,
+                )
+            else:
+                _learn_logger.info(
+                    "GSP_E2E_UNIFIED_TARGET_ARITH: off — legacy E2E Q-target "
+                    "= rewards + gamma(%s)*bootstrap (no reward_scale, no "
+                    "Q_TARGET_CLIP, no critic grad clip; plain-DDQN arms "
+                    "apply reward_scale=%s q_target_clip=%s grad_clip=%s)",
+                    self.gamma, self.reward_scale, self.q_target_clip,
+                    self.grad_clip_norm,
+                )
+
         # GSP_SPLICE_ADVANTAGE_ONLY (default False): dueling Q-head with the
         # spliced GSP prediction wired into the ADVANTAGE stream only.
         # Motivation (2026-07-09 Q-probe, stelaris
@@ -1288,7 +1339,17 @@ class NetworkAids(Hyperparameters):
             q_eval_next = networks['q_eval'](states_)
             max_actions = T.argmax(q_eval_next, dim=1)
             q_next[dones] = 0.0
-            q_target = rewards + self.gamma * q_next[indices, max_actions]
+            if self.gsp_e2e_unified_target_arith:
+                # GSP_E2E_UNIFIED_TARGET_ARITH: identical Bellman arithmetic
+                # to learn_DDQN — reward_scale * rewards + gamma * bootstrap,
+                # then the Q_TARGET_CLIP clamp (_q_target). Closes the
+                # IC-vs-E2E 10x effective-reward-scale asymmetry under
+                # REWARD_SCALE recipes (see the flag's config-block comment).
+                q_target = self._q_target(rewards, q_next[indices, max_actions])
+            else:
+                # Legacy (pre-flag) arithmetic, byte-identical and
+                # golden-tested: raw rewards, no reward_scale, no target clip.
+                q_target = rewards + self.gamma * q_next[indices, max_actions]
 
         # --- 6. Combined loss ---
         ddqn_loss = networks['q_eval'].loss(q_target, q_pred).to(device)
@@ -1304,6 +1365,17 @@ class NetworkAids(Hyperparameters):
         # --- 7. Backward + gradient clipping ---
         total_loss.backward()
         _check_nan(total_loss, f"E2E total loss at step {networks['learn_step_counter']}")
+
+        # GSP_E2E_UNIFIED_TARGET_ARITH: mirror learn_DDQN's critic-grad-clip
+        # treatment — _clip_critic_grad(q_eval) after backward, before the
+        # optimizer step (a no-op when GRAD_CLIP_NORM=0, same as the plain
+        # path). Legacy path: q_eval is NEVER clipped here (only the GSP head
+        # clips below) — kept byte-identical. The ddqn_grad_norm diagnostic
+        # below therefore reads the POST-clip norm when the flag is on: the
+        # value the optimizer actually consumes (consumption-boundary
+        # logging), consistent with the gsp post-clip norm next to it.
+        if self.gsp_e2e_unified_target_arith:
+            self._clip_critic_grad(networks['q_eval'])
 
         # Pre-clip GSP grad norm for diagnostics
         gsp_params = list(gsp_networks['actor'].parameters())
