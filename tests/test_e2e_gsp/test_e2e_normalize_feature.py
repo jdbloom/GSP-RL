@@ -52,6 +52,25 @@ class TestFlagDefaultAndParsing:
         aids = NetworkAids(cfg)
         assert aids.gsp_e2e_normalize_feature is True
 
+    def test_ema_halflife_default_is_zero(self):
+        """GSP_E2E_NORMALIZE_EMA_HALFLIFE unset -> 0.0 (legacy all-history
+        Welford; byte-identical to existing runs)."""
+        aids = NetworkAids(dict(MINIMAL_CONFIG))
+        assert aids.gsp_e2e_normalize_ema_halflife == 0.0
+
+    def test_ema_halflife_key_read(self):
+        cfg = dict(MINIMAL_CONFIG)
+        cfg['GSP_E2E_NORMALIZE_EMA_HALFLIFE'] = 250
+        aids = NetworkAids(cfg)
+        assert aids.gsp_e2e_normalize_ema_halflife == 250.0
+
+    def test_ema_halflife_none_is_zero(self):
+        """A YAML null (None) value degrades to 0.0, not a TypeError."""
+        cfg = dict(MINIMAL_CONFIG)
+        cfg['GSP_E2E_NORMALIZE_EMA_HALFLIFE'] = None
+        aids = NetworkAids(cfg)
+        assert aids.gsp_e2e_normalize_ema_halflife == 0.0
+
 
 class TestFlagOffIsIdentical:
     """(b) Flag OFF -> the learn step is byte-identical to baseline (no stats
