@@ -47,6 +47,7 @@ class DDQN(nn.Module):
             name: str = 'DDQN',
             use_layer_norm: bool = False,
             critic_loss: str = 'mse',
+            advantage_only_pred: tuple | None = None,
     ) -> None:
         """Initialize DDQN network.
 
@@ -69,11 +70,33 @@ class DDQN(nn.Module):
                 the most effective divergence control under Adam where a global
                 gradient rescale is normalized away. Controlled by the CRITIC_LOSS
                 config flag.
+            advantage_only_pred: None (default, legacy) or (start, width) — the
+                column span of the spliced GSP prediction inside the input.
+                When set, the net becomes a DUELING head with the split placed so
+                the prediction reaches ONLY the advantage stream
+                (GSP_SPLICE_ADVANTAGE_ONLY):
+                  * A(s,a): the existing fc1→fc2→fc3 trunk over the FULL input
+                    (obs + pred) — fc3's output is reinterpreted as advantages;
+                  * V(s):   a parallel v_fc1→v_fc2→v_fc3 stream over the input
+                    with the pred columns REMOVED, so the prediction cannot
+                    influence the state-value by construction;
+                  * Q = V + A - mean(A).
+                Motivation (2026-07-09 Q-probe): with the flat head, the spliced
+                prediction's effect on Q is ~99.8% common-mode (a state-value
+                offset) — the gradient-cheapest absorption of an action-invariant
+                input. The dueling split architecturally forbids common-mode
+                absorption: the feature can only express itself as action
+                preference. None = byte-identical legacy flat Q-head (no extra
+                modules, no extra RNG draws, same op sequence).
         """
         super().__init__()
 
         self.name = name
         self.use_layer_norm = use_layer_norm
+        self.advantage_only_pred = (
+            None if advantage_only_pred is None
+            else (int(advantage_only_pred[0]), int(advantage_only_pred[1]))
+        )
 
         self.fc1 = nn.Linear(input_size, fc1_dims)
         self.fc2 = nn.Linear(fc1_dims, fc2_dims)
@@ -82,6 +105,37 @@ class DDQN(nn.Module):
         if self.use_layer_norm:
             self.ln1 = nn.LayerNorm(fc1_dims)
             self.ln2 = nn.LayerNorm(fc2_dims)
+
+        if self.advantage_only_pred is not None:
+            # Dueling value stream. Built AFTER the trunk so the trunk's RNG
+            # draws are unchanged vs legacy; when advantage_only_pred is None
+            # this whole block is skipped and construction is byte-identical.
+            start, width = self.advantage_only_pred
+            if width < 1 or start < 0 or start + width > input_size:
+                raise ValueError(
+                    f'{name}: advantage_only_pred span ({start}, {width}) does '
+                    f'not fit inside input_size {input_size}'
+                )
+            v_input_size = input_size - width
+            if v_input_size < 1:
+                raise ValueError(
+                    f'{name}: advantage_only_pred removes ALL input columns '
+                    f'(input_size {input_size}, pred width {width}) — the value '
+                    'stream would have no input'
+                )
+            self.v_fc1 = nn.Linear(v_input_size, fc1_dims)
+            self.v_fc2 = nn.Linear(fc1_dims, fc2_dims)
+            self.v_fc3 = nn.Linear(fc2_dims, 1)
+            if self.use_layer_norm:
+                self.v_ln1 = nn.LayerNorm(fc1_dims)
+                self.v_ln2 = nn.LayerNorm(fc2_dims)
+            # Instance-level profile override so the per-episode diagnostics
+            # (weight norms / grad norms) cover the value stream from day one.
+            self.DIAGNOSTIC_PROFILE = {
+                **self.DIAGNOSTIC_PROFILE,
+                'wnorm_layers': ['fc1', 'fc2', 'fc3', 'v_fc1', 'v_fc2', 'v_fc3'],
+                'grad_layers': ['fc1', 'fc2', 'fc3', 'v_fc1', 'v_fc2', 'v_fc3'],
+            }
 
         # float(lr): a YAML-sourced sci-notation LR (e.g. '3e-05') can arrive as
         # a str and crash Adam's `0.0 <= lr` check. Defensive at the call site.
@@ -95,6 +149,13 @@ class DDQN(nn.Module):
 
     def forward(self, state: T.Tensor) -> T.Tensor:
         """Compute Q-values for all actions given a state.
+
+        Legacy (advantage_only_pred is None): the fc trunk's output IS Q.
+        Dueling (GSP_SPLICE_ADVANTAGE_ONLY): the trunk output is reinterpreted
+        as A(s,a); V(s) comes from the pred-excluded value stream; and
+        Q = V + A - mean(A). mean(A) subtraction makes the decomposition
+        identifiable (Wang et al. 2016) — V(s) == mean_a Q(s,a), so the spliced
+        prediction provably cannot move the common-mode component of Q.
 
         Args:
             state: Observation tensor of shape (*, input_size).
@@ -111,7 +172,43 @@ class DDQN(nn.Module):
             x = self.ln2(x)
         x1 = F.relu(x)
         actions = self.fc3(x1)
-        return actions
+        if self.advantage_only_pred is None:
+            return actions
+        advantage = actions
+        value = self.value_stream(state)
+        return value + advantage - advantage.mean(dim=-1, keepdim=True)
+
+    def value_stream(self, state: T.Tensor) -> T.Tensor:
+        """Dueling V(s): forward the value stream on the pred-EXCLUDED input.
+
+        Only valid when advantage_only_pred is set. The pred columns
+        [start, start+width) are removed from the input before v_fc1, so no
+        gradient path (and no functional path) exists from the spliced GSP
+        prediction into V — the architectural guarantee under test.
+
+        Args:
+            state: Observation tensor of shape (*, input_size) — the FULL
+                augmented input; the slicing happens here.
+
+        Returns:
+            State-value tensor of shape (*, 1).
+        """
+        if self.advantage_only_pred is None:
+            raise RuntimeError(
+                f'{self.name}: value_stream called on a non-dueling net '
+                '(advantage_only_pred is None)'
+            )
+        start, width = self.advantage_only_pred
+        v_in = T.cat([state[..., :start], state[..., start + width:]], dim=-1)
+        v = self.v_fc1(v_in)
+        if self.use_layer_norm:
+            v = self.v_ln1(v)
+        v = F.relu(v)
+        v = self.v_fc2(v)
+        if self.use_layer_norm:
+            v = self.v_ln2(v)
+        v = F.relu(v)
+        return self.v_fc3(v)
 
     def penultimate(self, state: T.Tensor) -> T.Tensor:
         """Return post-ReLU activations of fc2 — the feature vector immediately

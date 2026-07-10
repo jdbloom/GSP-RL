@@ -262,6 +262,42 @@ class Actor(NetworkAids):
         self.last_gsp_jepa_stats: dict | None = None
 
     def build_networks(self, learning_scheme):
+        # GSP_SPLICE_ADVANTAGE_ONLY effective gate. The flag targets exactly one
+        # architecture: a discrete Q-head (DQN/DDQN) with a K-dim GSP prediction
+        # spliced at columns [input_size, input_size+K) of the augmented obs.
+        # Anything else is rejected LOUDLY at construction — a silently-ignored
+        # flag here would produce a flat-head arm labeled as an advantage-splice
+        # arm (the flag-drop bug class behind the coupled-JEPA incident).
+        # self.gsp_splice_advantage_engaged is the single condition source the
+        # host (RL-CT Main.py) reads for its fail-loud startup line.
+        self.gsp_splice_advantage_engaged = False
+        if getattr(self, 'gsp_splice_advantage_only', False):
+            if learning_scheme not in ('DQN', 'DDQN'):
+                raise ValueError(
+                    'GSP_SPLICE_ADVANTAGE_ONLY requires a discrete dueling-able '
+                    f'Q-head (DQN/DDQN); got learning_scheme={learning_scheme!r}. '
+                    'DDPG/RDDPG/TD3 actors have no Q(s,a) table to split.'
+                )
+            if not self.gsp:
+                raise ValueError(
+                    'GSP_SPLICE_ADVANTAGE_ONLY is set but gsp=False — there is '
+                    'no spliced prediction slot to route into the advantage '
+                    'stream.'
+                )
+            if getattr(self, 'gsp_jepa_enabled', False):
+                raise ValueError(
+                    'GSP_SPLICE_ADVANTAGE_ONLY does not support the JEPA latent '
+                    'splice (GSP_JEPA_ENABLED): the latent obs layout (and '
+                    'latent-primary env-obs drop) breaks the '
+                    '[obs | pred-at-input_size] span the value stream excludes.'
+                )
+            if getattr(self, 'gsp_sf_enabled', False):
+                raise ValueError(
+                    'GSP_SPLICE_ADVANTAGE_ONLY does not support the '
+                    'successor-features head (GSP_SF_ENABLED): DDQN_SF outputs '
+                    'psi(s,a), not scalar Q — there is no V/A split to place.'
+                )
+            self.gsp_splice_advantage_engaged = True
         if learning_scheme == 'None':
             self.networks = {'learning_scheme': '', 'learn_step_counter': 0}
         if learning_scheme == 'DQN':
@@ -272,6 +308,14 @@ class Actor(NetworkAids):
                 'input_size':self.network_input_size,
                 'use_layer_norm': getattr(self, 'actor_use_layer_norm', False),
             }
+            # Advantage-only splice (gate validated above): the GSP prediction
+            # occupies columns [input_size, input_size + K) of the augmented
+            # obs — the same span learn_DQN/learn_DDQN_e2e splice at
+            # (gsp_idx = self.input_size, width = gsp_network_output).
+            if self.gsp_splice_advantage_engaged:
+                nn_args['advantage_only_pred'] = (
+                    self.input_size, int(self.gsp_network_output)
+                )
             self.networks = self.build_DQN(nn_args)
             self.networks['learning_scheme'] = 'DQN'
             # gsp_obs is stored in the main replay for BOTH the legacy e2e path
@@ -297,6 +341,13 @@ class Actor(NetworkAids):
                 'use_layer_norm': getattr(self, 'actor_use_layer_norm', False),
                 'critic_loss': getattr(self, 'critic_loss', 'mse'),
             }
+            # Advantage-only splice (gate validated above; mutually exclusive
+            # with GSP_SF_ENABLED which raised there). Same span contract as
+            # the DQN branch: (gsp_idx = self.input_size, K).
+            if self.gsp_splice_advantage_engaged:
+                nn_args['advantage_only_pred'] = (
+                    self.input_size, int(self.gsp_network_output)
+                )
             # Successor-Features head (GSP_SF_ENABLED): swap the scalar-Q DDQN pair
             # for the DDQN_SF pair (psi + learned reward-weight w), and allocate the
             # replay's phi column so the per-step cumulant is stored. Default OFF —
