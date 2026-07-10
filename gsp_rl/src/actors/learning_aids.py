@@ -387,6 +387,38 @@ class Hyperparameters:
             1.0 if _gain_raw is None else _gain_raw
         )
 
+        # GSP_SPLICE_ADVANTAGE_ONLY (default False): dueling Q-head with the
+        # spliced GSP prediction wired into the ADVANTAGE stream only.
+        # Motivation (2026-07-09 Q-probe, stelaris
+        # tools/analysis/q_sensitivity_probe.py): with the flat Q-head the actor
+        # consumes the spliced prediction but its effect on Q is ~99.8%
+        # common-mode (a state-value offset) and only ~0.2% differential — the
+        # prediction is an action-invariant input, and value-offset is the
+        # gradient-cheapest absorption, so argmax flips on only ~1-2% of states.
+        # When True (DQN/DDQN + GSP splice only), the Q-net becomes dueling:
+        # V(s) from the pred-EXCLUDED input, A(s,a) from the full input,
+        # Q = V + A - mean(A) — common-mode absorption of the prediction is
+        # architecturally forbidden; the feature can only express itself as
+        # action preference. The E2E gradient path through the splice is
+        # unchanged (the advantage trunk is the same fc1/fc2/fc3 the flat head
+        # used; GSP_E2E_STOP_GRAD_FEATURE still governs detachment). Effective
+        # gate + loud rejection of unsupported schemes live in
+        # Actor.build_networks. Default False = byte-identical legacy flat head.
+        self.gsp_splice_advantage_only = bool(
+            config.get('GSP_SPLICE_ADVANTAGE_ONLY', False)
+        )
+        # GLOBAL_KNOWLEDGE (default False): mirrored into the config by the
+        # host (RL-CT Main.py mirrors its --global_knowledge CLI flag, the same
+        # #53-B single-condition-source pattern as INDEPENDENT_LEARNING). The
+        # host layout under global knowledge is
+        # [env_obs, pred(K), global_knowledge((R-1)*4)] with input_size
+        # INCLUDING the global-knowledge width, so the advantage-only splice's
+        # (input_size, K) pred-column span would point at the global-knowledge
+        # TAIL instead of the prediction — Actor.build_networks reads this to
+        # reject that combination loudly instead of letting V silently read
+        # the prediction.
+        self.global_knowledge = bool(config.get('GLOBAL_KNOWLEDGE', False))
+
         # H-13 closure: LayerNorm in the main DQN/DDQN action network's trunk.
         # Independent of GSP_USE_LAYER_NORM (which only affects the GSP head).
         # Default False preserves legacy behavior. See

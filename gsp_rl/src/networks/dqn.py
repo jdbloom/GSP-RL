@@ -46,6 +46,7 @@ class DQN(nn.Module):
             fc2_dims: int = 128,
             name: str = 'DQN',
             use_layer_norm: bool = False,
+            advantage_only_pred: tuple | None = None,
     ) -> None:
         """Initialize DQN network.
 
@@ -59,11 +60,21 @@ class DQN(nn.Module):
             name: Network name for checkpoint file naming.
             use_layer_norm: If True, insert LayerNorm after fc1 and fc2 (before each
                 ReLU). Defaults to False (legacy). See DDQN docstring for rationale.
+            advantage_only_pred: None (default, legacy) or (start, width) — the
+                column span of the spliced GSP prediction inside the input. When
+                set, the net becomes a dueling head where the prediction reaches
+                ONLY the advantage stream (GSP_SPLICE_ADVANTAGE_ONLY). See the
+                DDQN docstring for the full mechanism and motivation. None =
+                byte-identical legacy flat Q-head.
         """
         super().__init__()
 
         self.name = name
         self.use_layer_norm = use_layer_norm
+        self.advantage_only_pred = (
+            None if advantage_only_pred is None
+            else (int(advantage_only_pred[0]), int(advantage_only_pred[1]))
+        )
 
         self.fc1 = nn.Linear(input_size, fc1_dims)
         self.fc2 = nn.Linear(fc1_dims, fc2_dims)
@@ -72,6 +83,34 @@ class DQN(nn.Module):
         if self.use_layer_norm:
             self.ln1 = nn.LayerNorm(fc1_dims)
             self.ln2 = nn.LayerNorm(fc2_dims)
+
+        if self.advantage_only_pred is not None:
+            # Dueling value stream — see DDQN.__init__ for the full rationale.
+            # Built AFTER the trunk so trunk RNG draws are unchanged vs legacy.
+            start, width = self.advantage_only_pred
+            if width < 1 or start < 0 or start + width > input_size:
+                raise ValueError(
+                    f'{name}: advantage_only_pred span ({start}, {width}) does '
+                    f'not fit inside input_size {input_size}'
+                )
+            v_input_size = input_size - width
+            if v_input_size < 1:
+                raise ValueError(
+                    f'{name}: advantage_only_pred removes ALL input columns '
+                    f'(input_size {input_size}, pred width {width}) — the value '
+                    'stream would have no input'
+                )
+            self.v_fc1 = nn.Linear(v_input_size, fc1_dims)
+            self.v_fc2 = nn.Linear(fc1_dims, fc2_dims)
+            self.v_fc3 = nn.Linear(fc2_dims, 1)
+            if self.use_layer_norm:
+                self.v_ln1 = nn.LayerNorm(fc1_dims)
+                self.v_ln2 = nn.LayerNorm(fc2_dims)
+            self.DIAGNOSTIC_PROFILE = {
+                **self.DIAGNOSTIC_PROFILE,
+                'wnorm_layers': ['fc1', 'fc2', 'fc3', 'v_fc1', 'v_fc2', 'v_fc3'],
+                'grad_layers': ['fc1', 'fc2', 'fc3', 'v_fc1', 'v_fc2', 'v_fc3'],
+            }
 
         self.optimizer = optim.Adam(self.parameters(), lr = lr, weight_decay = 1e-4)
 
@@ -100,7 +139,31 @@ class DQN(nn.Module):
         x1 = F.relu(x)
         actions = self.fc3(x1)
 
-        return actions
+        if self.advantage_only_pred is None:
+            return actions
+        # Dueling: trunk output = A(s,a); Q = V + A - mean(A). See DDQN.forward.
+        advantage = actions
+        value = self.value_stream(state)
+        return value + advantage - advantage.mean(dim=-1, keepdim=True)
+
+    def value_stream(self, state: T.Tensor) -> T.Tensor:
+        """Dueling V(s) on the pred-EXCLUDED input. See DDQN.value_stream."""
+        if self.advantage_only_pred is None:
+            raise RuntimeError(
+                f'{self.name}: value_stream called on a non-dueling net '
+                '(advantage_only_pred is None)'
+            )
+        start, width = self.advantage_only_pred
+        v_in = T.cat([state[..., :start], state[..., start + width:]], dim=-1)
+        v = self.v_fc1(v_in)
+        if self.use_layer_norm:
+            v = self.v_ln1(v)
+        v = F.relu(v)
+        v = self.v_fc2(v)
+        if self.use_layer_norm:
+            v = self.v_ln2(v)
+        v = F.relu(v)
+        return self.v_fc3(v)
 
     def penultimate(self, state: T.Tensor) -> T.Tensor:
         """Return post-ReLU activations of fc2. See DDQN.penultimate for rationale."""
