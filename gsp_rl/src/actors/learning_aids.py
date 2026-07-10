@@ -365,6 +365,28 @@ class Hyperparameters:
         # when the flag is on. Stays None when off → every splice byte-identical.
         self.gsp_feature_stats = None
 
+        # GSP_E2E_SPLICE_GAIN (default 1.0 = byte-identical no-op): a FIXED
+        # constant multiplier applied to the spliced GSP feature as the LAST
+        # transform before concatenation, at BOTH splice points (the learn
+        # splices here and RL-CT's acting splice, which reads this same attr
+        # through the shared Actor). The stateless salience lever replacing the
+        # deprecated running standardizer: with source-scaled labels
+        # (GSP_TRAJ_LABEL_SCALE) the head's output dispersion is capped by the
+        # tanh/clamp bound at ~0.1-0.2 std, and the 2026-07-10 lstd probe
+        # showed the actor ignores it (flips 1.5-2.6% ≈ the pre-normalize
+        # baseline; coupling needed ~unit scale). A constant gain (e.g. 10 for
+        # mature pred_std ~0.1) restores O(1) salience with nothing to
+        # checkpoint, restore, or warm up — train/eval identical by
+        # construction. Chosen from screen data, never adapted online. Applied
+        # AFTER the (optional) standardizer so the two compose predictably.
+        _gain_raw = config.get('GSP_E2E_SPLICE_GAIN', 1.0)
+        # None (YAML null) degrades to the default; an explicit 0.0 is kept —
+        # it is a legitimate severing endpoint of a gain sweep, not a falsy
+        # accident to be remapped.
+        self.gsp_e2e_splice_gain = float(
+            1.0 if _gain_raw is None else _gain_raw
+        )
+
         # H-13 closure: LayerNorm in the main DQN/DDQN action network's trunk.
         # Independent of GSP_USE_LAYER_NORM (which only affects the GSP head).
         # Default False preserves legacy behavior. See
@@ -1188,6 +1210,12 @@ class NetworkAids(Hyperparameters):
         if self.gsp_feature_stats is not None:
             gsp_pred_actor = self.gsp_feature_stats.standardize(gsp_pred_actor)
             self.gsp_feature_stats.update(gsp_pred.detach() * _GSP_ACTOR_SCALE)
+        # GSP_E2E_SPLICE_GAIN: fixed constant salience gain, the LAST transform
+        # before the splice (mirrors the acting splice in RL-CT
+        # make_agent_state). 1.0 = exact no-op. The postnorm diagnostic below
+        # deliberately reads AFTER the gain — it logs the scale the actor sees.
+        if self.gsp_e2e_splice_gain != 1.0:
+            gsp_pred_actor = gsp_pred_actor * self.gsp_e2e_splice_gain
         with T.no_grad():
             gsp_feature_std_postnorm = float(gsp_pred_actor.detach().std().item())
         gsp_idx = self.input_size
@@ -1740,6 +1768,12 @@ class NetworkAids(Hyperparameters):
         if self.gsp_feature_stats is not None:
             gsp_pred_actor = self.gsp_feature_stats.standardize(gsp_pred_actor)
             self.gsp_feature_stats.update(gsp_pred.detach() * _GSP_ACTOR_SCALE)
+        # GSP_E2E_SPLICE_GAIN: fixed constant salience gain, the LAST transform
+        # before the splice (mirrors the acting splice in RL-CT
+        # make_agent_state). 1.0 = exact no-op. The postnorm diagnostic below
+        # deliberately reads AFTER the gain — it logs the scale the actor sees.
+        if self.gsp_e2e_splice_gain != 1.0:
+            gsp_pred_actor = gsp_pred_actor * self.gsp_e2e_splice_gain
         with T.no_grad():
             gsp_feature_std_postnorm = float(gsp_pred_actor.detach().std().item())
         gsp_idx = self.input_size
@@ -1855,6 +1889,17 @@ class NetworkAids(Hyperparameters):
         gsp_pred_actor_step = gsp_pred_actor_step * _GSP_ACTOR_SCALE
         if self.gsp_e2e_stop_grad_feature:
             gsp_pred_actor_step = gsp_pred_actor_step.detach()
+        # Mirror the critic-path slot pipeline exactly (standardize with the
+        # frozen stats, then the fixed splice gain): the actor's deterministic
+        # policy gradient must be computed on the SAME feature scale the critic
+        # was trained on and acting sees, or the policy is optimized on a state
+        # distribution it never encounters (review finding, 2026-07-10).
+        if self.gsp_feature_stats is not None:
+            gsp_pred_actor_step = self.gsp_feature_stats.standardize(
+                gsp_pred_actor_step
+            )
+        if self.gsp_e2e_splice_gain != 1.0:
+            gsp_pred_actor_step = gsp_pred_actor_step * self.gsp_e2e_splice_gain
         augmented_actor = T.cat(
             [states[:, :gsp_idx], gsp_pred_actor_step,
              states[:, gsp_idx + _gsp_slot:]],

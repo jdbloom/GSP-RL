@@ -126,6 +126,49 @@ class TestFeatureStdReflectsStandardizer:
         assert r['gsp_feature_std_postnorm'] > r['gsp_feature_std_prenorm']
 
 
+class TestSpliceGain:
+    def test_default_gain_is_one_and_noop(self):
+        aids, networks, gsp_networks = _ddqn_setup()
+        assert aids.gsp_e2e_splice_gain == 1.0
+        r = aids.learn_DDQN_e2e(networks, gsp_networks)
+        # gain 1.0 -> post == pre exactly (normalize off).
+        assert r['gsp_feature_std_postnorm'] == pytest.approx(r['gsp_feature_std_prenorm'])
+
+    def test_gain_scales_postnorm_by_constant(self):
+        # The postnorm diagnostic reads AFTER the gain — the scale the actor
+        # sees. With normalize off, post must equal gain × pre.
+        aids, networks, gsp_networks = _ddqn_setup()
+        aids.gsp_e2e_splice_gain = 10.0
+        r = aids.learn_DDQN_e2e(networks, gsp_networks)
+        assert r['gsp_feature_std_postnorm'] == pytest.approx(
+            10.0 * r['gsp_feature_std_prenorm'], rel=1e-5
+        )
+
+    def test_gain_composes_after_standardizer(self):
+        # normalize on + gain: gain is the LAST transform, so within one run
+        # post == gain × prenorm / stats.std exactly (standardize is an affine
+        # (x − m)/s, which scales the std by 1/s; the gain then multiplies it).
+        aids, networks, gsp_networks = _ddqn_setup()
+        stats = RunningStandardizer(dim=1)
+        stats.update(np.random.default_rng(0).normal(5.0, 0.02, size=(512, 1)))
+        aids.gsp_e2e_normalize_feature = True
+        aids.gsp_feature_stats = stats
+        aids.gsp_e2e_splice_gain = 3.0
+        std_before_update = float(stats.std[0])
+        r = aids.learn_DDQN_e2e(networks, gsp_networks)
+        assert r['gsp_feature_std_postnorm'] == pytest.approx(
+            3.0 * r['gsp_feature_std_prenorm'] / std_before_update, rel=1e-3
+        )
+
+    def test_td3_gain_scales_postnorm(self):
+        aids, networks, gsp_networks = _td3_setup()
+        aids.gsp_e2e_splice_gain = 10.0
+        r = aids.learn_TD3_e2e(networks, gsp_networks)
+        assert r['gsp_feature_std_postnorm'] == pytest.approx(
+            10.0 * r['gsp_feature_std_prenorm'], rel=1e-5
+        )
+
+
 class TestNoPerturbation:
     """The diagnostic must not change training dynamics: a run WITH the metric
     must be bit-identical in learned params to one WITHOUT it.
