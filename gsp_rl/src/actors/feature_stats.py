@@ -30,6 +30,19 @@ inside the learn splice. Acting standardizes with the current (frozen) stats and
 never updates. At eval no learn step runs, so the stats are automatically frozen.
 This keeps train/eval symmetric: eval uses the stats learned during training.
 
+Persistence contract
+--------------------
+The stats are part of the policy: an actor trained on the standardized feature
+is calibrated to ~unit-std input, so an eval process that reconstructs the
+standardizer cold (``count == 0`` → ``standardize`` is the identity) feeds the
+policy the RAW tiny-scale feature — a silent ~40x input-scale mismatch that
+nulls the coupling in every arm of an ablation. Measured incident (2026-07-10):
+every fresh-process ablation eval of the force-causal-use campaign ran with the
+identity standardize, voiding the paired-gap verdict. ``save``/``restore``
+serialize the full state (both Welford and EMA fields) to ``.npz``;
+``Actor.save_model``/``load_model`` call them alongside the network
+checkpoints whenever ``gsp_feature_stats`` is present.
+
 Numerics
 --------
 Default mode (``ema_halflife == 0``): per-dimension Welford online mean/variance
@@ -203,6 +216,54 @@ class RunningStandardizer:
         self._mean = self._mean + delta * (n_b / tot)
         self._m2 = self._m2 + m2_b + (delta ** 2) * (n_a * n_b / tot)
         self.count = tot
+
+    def save(self, path: str) -> None:
+        """Serialize the full standardizer state (Welford + EMA fields) to
+        ``path`` as a ``.npz``. Called from ``Actor.save_model`` next to the
+        network checkpoints — the stats are part of the policy (see the
+        persistence contract in the module docstring)."""
+        np.savez(
+            path,
+            dim=np.int64(self.dim),
+            eps=np.float64(self.eps),
+            count=np.int64(self.count),
+            mean=self._mean,
+            m2=self._m2,
+            ema_halflife=np.float64(self.ema_halflife),
+            updates=np.int64(self._updates),
+            ema_mean=self._ema_mean,
+            ema_sq=self._ema_sq,
+        )
+
+    def restore(self, path: str) -> None:
+        """Load state saved by ``save`` into this instance, in place.
+
+        Raises ``ValueError`` on a feature-width mismatch (restoring stats for
+        a different K would silently mis-scale every dimension). ``eps`` and
+        ``ema_halflife`` are restored from the file: the saved run's numerics
+        define how the policy was trained, and the restoring process must
+        reproduce them exactly.
+        """
+        with np.load(path) as z:
+            file_dim = int(z["dim"])
+            if file_dim != self.dim:
+                raise ValueError(
+                    f"RunningStandardizer.restore: file dim {file_dim} != "
+                    f"instance dim {self.dim}"
+                )
+            self.eps = float(z["eps"])
+            self.count = int(z["count"])
+            self._mean = z["mean"].astype(np.float64)
+            self._m2 = z["m2"].astype(np.float64)
+            self.ema_halflife = float(z["ema_halflife"])
+            self._beta = (
+                0.5 ** (1.0 / self.ema_halflife)
+                if self.ema_halflife > 0
+                else 0.0
+            )
+            self._updates = int(z["updates"])
+            self._ema_mean = z["ema_mean"].astype(np.float64)
+            self._ema_sq = z["ema_sq"].astype(np.float64)
 
     def standardize(self, x):
         """Return ``(x - mean) / std`` using the current (frozen) stats.
