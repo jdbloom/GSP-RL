@@ -1302,6 +1302,11 @@ class Actor(NetworkAids):
         # they checkpoint with the networks. Without this, a fresh-process eval
         # reconstructs the standardizer cold and standardize() is the identity
         # — the 2026-07-10 eval-restore incident that voided an ablation batch.
+        # Known limitation: in RL-CT independent-learning mode every robot
+        # saves to the SAME path, so this file is last-writer-wins — exactly
+        # like the id-less DDQN network checkpoint it sits next to. The
+        # restored (weights, stats) pair stays self-consistent; fixing the
+        # collision means id-suffixing BOTH, together.
         if getattr(self, 'gsp_feature_stats', None) is not None:
             self.gsp_feature_stats.save(f"{path}_feature_stats.npz")
 
@@ -1349,12 +1354,25 @@ class Actor(NetworkAids):
                 self.gsp_networks['target_critic_2'].load_checkpoint(path, self.gsp)
         # Restore the feature-standardizer stats saved by save_model. Missing
         # file → stats stay cold (pre-persistence checkpoints); the eval-side
-        # warm-up (RL-CT) is the fallback for those.
+        # warm-up (RL-CT) is the fallback for those. A corrupt/truncated file
+        # (save_model is not atomic; daemon restarts kill mid-checkpoint) must
+        # degrade to the same cold-stats fallback, not crash the whole load —
+        # but loudly, so the eval config can be pointed at the warm-up.
         if getattr(self, 'gsp_feature_stats', None) is not None:
             import os
             _stats_path = f"{path}_feature_stats.npz"
             if os.path.exists(_stats_path):
-                self.gsp_feature_stats.restore(_stats_path)
+                try:
+                    self.gsp_feature_stats.restore(_stats_path)
+                except ValueError:
+                    # dim mismatch — a real config error, never swallow.
+                    raise
+                except Exception as exc:
+                    print(
+                        f"[feature_stats] WARNING: could not restore "
+                        f"{_stats_path} ({exc!r}); stats stay cold — enable "
+                        f"GSP_EVAL_FEATURE_STATS_WARMUP_EPISODES for this eval"
+                    )
 
     def save_gsp_head_snapshot(self, path: str) -> None:
         """Save ONLY the GSP prediction network's weights to `path`.

@@ -186,6 +186,26 @@ def test_actor_load_without_stats_file_is_noop(tmp_path):
     assert fresh.gsp_feature_stats.count == 0
 
 
+def test_actor_load_with_corrupt_stats_file_degrades_to_cold(tmp_path):
+    """A truncated/corrupt npz (non-atomic save killed mid-checkpoint) must
+    not crash load_model — it degrades to cold stats (the eval warm-up
+    fallback), loudly."""
+    actor = _make_actor(
+        GSP_E2E_ENABLED=True, GSP_E2E_NORMALIZE_FEATURE=True,
+    )
+    ckpt = str(tmp_path / "Episode_10")
+    actor.save_model(ckpt)
+    # Truncate the stats file to simulate a mid-write kill.
+    stats_file = tmp_path / "Episode_10_feature_stats.npz"
+    stats_file.write_bytes(stats_file.read_bytes()[:20])
+
+    fresh = _make_actor(
+        GSP_E2E_ENABLED=True, GSP_E2E_NORMALIZE_FEATURE=True,
+    )
+    fresh.load_model(ckpt)  # must not raise
+    assert fresh.gsp_feature_stats.count == 0
+
+
 def test_actor_without_normalize_flag_saves_no_stats_file(tmp_path):
     """Flag off → gsp_feature_stats is None → save_model writes no stats file
     (byte-identical legacy checkpoint layout)."""
