@@ -1154,8 +1154,11 @@ class NetworkAids(Hyperparameters):
         # stored next-state slot — an internally inconsistent Bellman update that
         # prevented the E2E actor from learning. Applying the scale to a K>1 slot
         # would re-introduce that same inconsistency vs the RAW vector path, so it
-        # is gated on K==1. The head's supervised MSE below always uses the RAW
-        # pred (the label is raw).
+        # is gated on K==1. The head's supervised MSE below always uses the
+        # un-rescaled pred — the label arrives in whatever units RL-CT's label
+        # pipeline stored (raw physical units by default; meters ×
+        # GSP_TRAJ_LABEL_SCALE for the metric trajectory kinds since
+        # RL-CT#35). No splice-side rescaling happens either way.
         if _gsp_slot == 1:
             _GSP_ACTOR_SCALE = float(np.degrees(1.0) / 10.0)  # == degrees(x/10)/x
             gsp_pred_actor = gsp_pred * _GSP_ACTOR_SCALE
