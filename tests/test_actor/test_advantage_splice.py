@@ -400,6 +400,59 @@ class TestUnsupportedSchemesRaiseLoudly:
                 config_overrides={'GSP_SPLICE_ADVANTAGE_ONLY': True,
                                   'GSP_JEPA_ENABLED': True})
 
+    def test_global_knowledge_raises(self):
+        """Under global knowledge the host layout is [env_obs, pred(K), gk]
+        with input_size INCLUDING the gk width, so the (input_size, K) span
+        would exclude the gk TAIL instead of the pred — V would silently read
+        the prediction. Rejected loudly (review finding, GSP-RL#42)."""
+        with pytest.raises(ValueError, match='global_knowledge'):
+            _make_actor(
+                config_overrides={'GSP_SPLICE_ADVANTAGE_ONLY': True,
+                                  'GLOBAL_KNOWLEDGE': True})
+
+    def test_global_knowledge_without_flag_builds_flat_head(self):
+        """GLOBAL_KNOWLEDGE alone (splice flag off) stays a legal legacy build."""
+        actor = _make_actor(config_overrides={'GLOBAL_KNOWLEDGE': True})
+        assert actor.gsp_splice_advantage_engaged is False
+        assert actor.networks['q_eval'].advantage_only_pred is None
+
+
+class TestDuelingDiagnosticsProfile:
+    """The per-episode diagnostics must SEE the dueling value stream.
+
+    The dueling DQN/DDQN extends DIAGNOSTIC_PROFILE on the INSTANCE
+    (wnorm/grad layers += v_fc1/v_fc2/v_fc3); the consumer
+    (Actor.compute_diagnostics) must read the profile instance-first —
+    reading type(net).DIAGNOSTIC_PROFILE silently dropped the value stream
+    from every diagnostic (review finding, GSP-RL#42)."""
+
+    @staticmethod
+    def _diag_actor(config_overrides):
+        actor = _make_actor(config_overrides=config_overrides)
+        rng = np.random.default_rng(37)
+        actor.diag_actor_eval_batch = rng.standard_normal(
+            (32, actor.network_input_size)).astype(np.float32)
+        actor.diag_gsp_eval_batch = None
+        return actor
+
+    def test_dueling_diagnostics_cover_value_stream(self):
+        actor = self._diag_actor(_traj_config(GSP_SPLICE_ADVANTAGE_ONLY=True))
+        out = actor.compute_diagnostics()
+        for name in ('v_fc1', 'v_fc2', 'v_fc3'):
+            assert f'diag_actor_wnorm_{name}' in out, (
+                f'{name} missing from diagnostics — the consumer read the '
+                'CLASS profile and dropped the instance override')
+        # Trunk coverage unchanged alongside the value stream.
+        for name in ('fc1', 'fc2', 'fc3'):
+            assert f'diag_actor_wnorm_{name}' in out
+
+    def test_flat_diagnostics_unchanged(self):
+        actor = self._diag_actor(_traj_config())
+        out = actor.compute_diagnostics()
+        assert 'diag_actor_wnorm_fc1' in out
+        assert not any('v_fc' in k for k in out), (
+            'flat (non-dueling) diagnostics must not grow value-stream keys')
+
 
 class TestE2ELearnStepWithDueling:
     """learn_DDQN_e2e on a dueling q_eval/q_next pair: the splice stays
@@ -454,3 +507,36 @@ class TestE2ELearnStepWithDueling:
         aids.learn_DDQN_e2e(networks, gsp_networks)
 
         assert not T.equal(v_before, networks['q_eval'].v_fc1.weight.detach())
+
+    def test_lambda_zero_td_path_alone_reaches_gsp_head(self):
+        """gsp_e2e_lambda=0 removes the supervised MSE from the loss, so any
+        gradient on the head can only arrive through the TD path across the
+        splice into the advantage trunk. The lambda=1 test above cannot
+        isolate this — its supervised term alone satisfies gsp_grad_norm > 0
+        (review finding, GSP-RL#42)."""
+        aids = make_aids()
+        aids.gsp_e2e_lambda = 0.0
+        assert aids.gsp_e2e_stop_grad_feature is False  # default: TD path live
+        networks = self._dueling_networks()
+        gsp_networks = make_gsp_networks()
+
+        result = aids.learn_DDQN_e2e(networks, gsp_networks)
+
+        assert result['gsp_grad_norm_pre_clip'] > 0.0
+        assert result['gsp_grad_norm'] > 0.0
+
+    def test_lambda_zero_stop_grad_severs_gsp_head_exactly(self):
+        """gsp_e2e_lambda=0 + GSP_E2E_STOP_GRAD_FEATURE: the splice is
+        detached (TD path severed) and the supervised term contributes
+        0.0 * MSE, so the head's grad norm must be EXACTLY zero — any nonzero
+        value means the stop-grad leaks through the advantage trunk."""
+        aids = make_aids()
+        aids.gsp_e2e_lambda = 0.0
+        aids.gsp_e2e_stop_grad_feature = True
+        networks = self._dueling_networks()
+        gsp_networks = make_gsp_networks()
+
+        result = aids.learn_DDQN_e2e(networks, gsp_networks)
+
+        assert result['gsp_grad_norm_pre_clip'] == 0.0
+        assert result['gsp_grad_norm'] == 0.0

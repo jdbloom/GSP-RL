@@ -407,6 +407,17 @@ class Hyperparameters:
         self.gsp_splice_advantage_only = bool(
             config.get('GSP_SPLICE_ADVANTAGE_ONLY', False)
         )
+        # GLOBAL_KNOWLEDGE (default False): mirrored into the config by the
+        # host (RL-CT Main.py mirrors its --global_knowledge CLI flag, the same
+        # #53-B single-condition-source pattern as INDEPENDENT_LEARNING). The
+        # host layout under global knowledge is
+        # [env_obs, pred(K), global_knowledge((R-1)*4)] with input_size
+        # INCLUDING the global-knowledge width, so the advantage-only splice's
+        # (input_size, K) pred-column span would point at the global-knowledge
+        # TAIL instead of the prediction — Actor.build_networks reads this to
+        # reject that combination loudly instead of letting V silently read
+        # the prediction.
+        self.global_knowledge = bool(config.get('GLOBAL_KNOWLEDGE', False))
 
         # H-13 closure: LayerNorm in the main DQN/DDQN action network's trunk.
         # Independent of GSP_USE_LAYER_NORM (which only affects the GSP head).

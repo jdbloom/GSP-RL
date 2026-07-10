@@ -297,6 +297,17 @@ class Actor(NetworkAids):
                     'successor-features head (GSP_SF_ENABLED): DDQN_SF outputs '
                     'psi(s,a), not scalar Q — there is no V/A split to place.'
                 )
+            if getattr(self, 'global_knowledge', False):
+                raise ValueError(
+                    'GSP_SPLICE_ADVANTAGE_ONLY is incompatible with '
+                    'global_knowledge: the pred-column span cannot be trusted. '
+                    'The host obs layout is [env_obs, pred(K), '
+                    'global_knowledge((R-1)*4)] with input_size INCLUDING the '
+                    'global-knowledge width, so the (input_size, K) span the '
+                    'value stream excludes would cover the global-knowledge '
+                    'TAIL instead of the prediction — V would silently read '
+                    'the prediction, voiding the advantage-only contract.'
+                )
             self.gsp_splice_advantage_engaged = True
         if learning_scheme == 'None':
             self.networks = {'learning_scheme': '', 'learn_step_counter': 0}
@@ -1235,7 +1246,13 @@ class Actor(NetworkAids):
         if main_net is not None:
             device = next(main_net.parameters()).device
             actor_batch = T.from_numpy(self.diag_actor_eval_batch).to(device)
-            profile = getattr(type(main_net), 'DIAGNOSTIC_PROFILE', None)
+            # Instance-first read: normal attribute lookup falls back to the
+            # class attribute, but ALSO sees instance-level overrides — the
+            # dueling DQN/DDQN (GSP_SPLICE_ADVANTAGE_ONLY) sets a per-instance
+            # profile extending wnorm/grad layers with v_fc1/v_fc2/v_fc3.
+            # Reading type(main_net) here silently dropped the value stream
+            # from the diagnostics (review finding, GSP-RL#42).
+            profile = getattr(main_net, 'DIAGNOSTIC_PROFILE', None)
             if profile is not None:
                 out.update(self._diagnose_network(
                     main_net, actor_batch, 'diag_actor', profile,
@@ -1293,7 +1310,8 @@ class Actor(NetworkAids):
                 # Critic takes (state, action) but diagnostics probe state-only forward;
                 # we skip critic FAU/erank (critic forward signature differs) and only
                 # run weight norms, which don't require a forward pass.
-                c_profile = getattr(type(critic_net), 'DIAGNOSTIC_PROFILE', None)
+                # Instance-first (see main_net profile read above).
+                c_profile = getattr(critic_net, 'DIAGNOSTIC_PROFILE', None)
                 if c_profile is not None:
                     from gsp_rl.src.actors.diagnostics import compute_weight_norms
                     for k, v in compute_weight_norms(
@@ -1307,7 +1325,8 @@ class Actor(NetworkAids):
             if gsp_main is not None:
                 gsp_device = next(gsp_main.parameters()).device
                 gsp_batch = T.from_numpy(self.diag_gsp_eval_batch).to(gsp_device)
-                gsp_profile = getattr(type(gsp_main), 'DIAGNOSTIC_PROFILE', None)
+                # Instance-first (see main_net profile read above).
+                gsp_profile = getattr(gsp_main, 'DIAGNOSTIC_PROFILE', None)
                 if gsp_profile is not None:
                     out.update(self._diagnose_network(
                         gsp_main, gsp_batch, 'diag_gsp', gsp_profile,
@@ -1322,7 +1341,8 @@ class Actor(NetworkAids):
             if getattr(self, 'diagnose_critic', False):
                 gsp_critic = self._critic_network(self.gsp_networks)
                 if gsp_critic is not None:
-                    gc_profile = getattr(type(gsp_critic), 'DIAGNOSTIC_PROFILE', None)
+                    # Instance-first (see main_net profile read above).
+                    gc_profile = getattr(gsp_critic, 'DIAGNOSTIC_PROFILE', None)
                     if gc_profile is not None:
                         from gsp_rl.src.actors.diagnostics import compute_weight_norms
                         for k, v in compute_weight_norms(
