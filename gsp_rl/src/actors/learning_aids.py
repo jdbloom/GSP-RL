@@ -1231,8 +1231,8 @@ class NetworkAids(Hyperparameters):
             augmented.retain_grad()
 
         # --- 4. DDQN forward on augmented state ---
-        indices = T.LongTensor(np.arange(self.batch_size).astype(np.int64))
-        q_pred = networks['q_eval'](augmented)[indices, actions.type(T.LongTensor)]
+        indices = T.arange(self.batch_size, device=networks['q_eval'].device)
+        q_pred = networks['q_eval'](augmented)[indices, actions.long()]
 
         # --- 5. Target Q using STORED next-state (no GSP re-run) ---
         with T.no_grad():
@@ -1400,8 +1400,8 @@ class NetworkAids(Hyperparameters):
         )
 
         # --- 4. DDQN forward on augmented state ---
-        indices = T.LongTensor(np.arange(self.batch_size).astype(np.int64))
-        q_pred = networks['q_eval'](augmented)[indices, actions.type(T.LongTensor)]
+        indices = T.arange(self.batch_size, device=networks['q_eval'].device)
+        q_pred = networks['q_eval'](augmented)[indices, actions.long()]
 
         # --- 5. Stable Q-target from stored next-state (no encoder re-run) ---
         with T.no_grad():
@@ -1418,7 +1418,7 @@ class NetworkAids(Hyperparameters):
         if self.gsp_jepa_action_cond and self.gsp_predictor.action_dim > 0:
             # One-hot the discrete DDQN action to the configured action width.
             a_dim = self.gsp_predictor.action_dim
-            a_idx = actions.type(T.LongTensor).to(device)
+            a_idx = actions.long().to(device)
             a_onehot = F.one_hot(a_idx.clamp(0, a_dim - 1), num_classes=a_dim).float()
             z_pred = self.gsp_predictor(z_t, a_onehot)
         else:
