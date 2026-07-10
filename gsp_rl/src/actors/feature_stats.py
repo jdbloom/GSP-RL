@@ -32,11 +32,34 @@ This keeps train/eval symmetric: eval uses the stats learned during training.
 
 Numerics
 --------
-Per-dimension Welford online mean/variance so the running estimate is exact
-(no EMA horizon to tune) and matches an offline mean/var of the same samples.
-Before the first update (``count == 0``) ``standardize`` is the identity — there
-are no stats yet, so acting during the initial warmup sees the raw feature rather
-than a divide-by-nothing artifact.
+Default mode (``ema_halflife == 0``): per-dimension Welford online mean/variance
+so the running estimate is exact (no EMA horizon to tune) and matches an offline
+mean/var of the same samples. Before the first update (``count == 0``)
+``standardize`` is the identity — there are no stats yet, so acting during the
+initial warmup sees the raw feature rather than a divide-by-nothing artifact.
+
+EMA mode (``ema_halflife > 0``, opt-in via ``GSP_E2E_NORMALIZE_EMA_HALFLIFE``):
+all-history Welford never forgets. Measured failure (2026-07-09, live cells): at
+high ``GSP_E2E_LAMBDA`` (40000) the head's early outputs are large/noisy and
+permanently inflate the running std, so the post-norm feature std reached only
+0.17-0.39 instead of ~1.0 — the standardizer silently re-shrank the feature it
+exists to normalize. In EMA mode the stats are a bias-corrected exponential
+moving average (Adam-style) over UPDATE calls (i.e. learn steps, not samples):
+per update ``t`` with batch mean ``m_t`` and batch raw second moment ``s_t``,
+
+    ema_mean_t = beta * ema_mean_{t-1} + (1 - beta) * m_t
+    ema_sq_t   = beta * ema_sq_{t-1}   + (1 - beta) * s_t
+    mean = ema_mean_t / (1 - beta^t)
+    var  = max(ema_sq_t / (1 - beta^t) - mean^2, 0)
+
+with ``beta = 0.5 ** (1 / ema_halflife)`` so a batch's weight halves every
+``ema_halflife`` updates. The bias correction ``1 / (1 - beta^t)`` makes the
+warmup exact rather than zero-shrunk: at ``t == 1`` the stats equal the first
+batch's mean/var (identical to Welford), and for ``t << ema_halflife`` they
+approximate a near-uniform average of the batches seen so far — no separate
+Welford warmup phase is needed. The ``count == 0`` identity behavior is
+unchanged. ``ema_halflife == 0`` (the default) leaves the legacy Welford path
+byte-identical for existing runs.
 """
 
 from __future__ import annotations
@@ -45,7 +68,7 @@ import numpy as np
 
 
 class RunningStandardizer:
-    """Per-dimension running standardizer (Welford mean/variance).
+    """Per-dimension running standardizer (Welford or EMA mean/variance).
 
     Parameters
     ----------
@@ -53,11 +76,22 @@ class RunningStandardizer:
         Feature width (K). One (mean, M2) pair is tracked per dimension.
     eps : float
         Variance floor added under the sqrt for numerical stability.
+    ema_halflife : float
+        Exponential-moving-average half-life in UPDATE counts (learn steps).
+        0 (default) = legacy all-history Welford, byte-identical to prior runs.
+        > 0 = bias-corrected EMA mean/variance whose per-batch weight halves
+        every ``ema_halflife`` updates, so the stats track the RECENT feature
+        distribution and forget an inflated early phase (see module docstring).
     """
 
-    __slots__ = ("dim", "eps", "count", "_mean", "_m2")
+    __slots__ = (
+        "dim", "eps", "count", "_mean", "_m2",
+        "ema_halflife", "_beta", "_updates", "_ema_mean", "_ema_sq",
+    )
 
-    def __init__(self, dim: int, eps: float = 1e-5) -> None:
+    def __init__(
+        self, dim: int, eps: float = 1e-5, ema_halflife: float = 0.0
+    ) -> None:
         if dim < 1:
             raise ValueError(f"RunningStandardizer dim must be >= 1, got {dim}")
         self.dim = int(dim)
@@ -65,20 +99,49 @@ class RunningStandardizer:
         self.count: int = 0
         self._mean = np.zeros(self.dim, dtype=np.float64)
         self._m2 = np.zeros(self.dim, dtype=np.float64)
+        self.ema_halflife = float(ema_halflife)
+        if self.ema_halflife < 0:
+            raise ValueError(
+                f"RunningStandardizer ema_halflife must be >= 0, "
+                f"got {ema_halflife}"
+            )
+        # EMA state (inert when ema_halflife == 0 — the legacy Welford fields
+        # above remain the sole source of truth in that mode).
+        self._beta = (
+            0.5 ** (1.0 / self.ema_halflife) if self.ema_halflife > 0 else 0.0
+        )
+        self._updates: int = 0
+        self._ema_mean = np.zeros(self.dim, dtype=np.float64)
+        self._ema_sq = np.zeros(self.dim, dtype=np.float64)
 
     # --- read-only views of the current (frozen) stats ---
     @property
     def mean(self) -> np.ndarray:
-        """Current running mean, shape (dim,). Zeros before any update."""
+        """Current running mean, shape (dim,). Zeros before any update.
+
+        EMA mode: bias-corrected EMA of the batch means (exact batch mean at
+        the first update)."""
+        if self.ema_halflife > 0:
+            if self._updates == 0:
+                return np.zeros(self.dim, dtype=np.float64)
+            return self._ema_mean / (1.0 - self._beta ** self._updates)
         return self._mean.copy()
 
     @property
     def var(self) -> np.ndarray:
         """Current running (population) variance, shape (dim,).
 
-        Zeros before any update and while count < 2 (a single sample has no
-        variance); ``standardize`` then divides by sqrt(eps) only.
+        Welford mode: zeros before any update and while count < 2 (a single
+        sample has no variance); ``standardize`` then divides by sqrt(eps) only.
+        EMA mode: ``E_ema[x^2] - E_ema[x]^2`` with bias-corrected moments,
+        clipped at 0 against floating-point cancellation.
         """
+        if self.ema_halflife > 0:
+            if self._updates == 0:
+                return np.zeros(self.dim, dtype=np.float64)
+            corr = 1.0 - self._beta ** self._updates
+            mean_hat = self._ema_mean / corr
+            return np.maximum(self._ema_sq / corr - mean_hat ** 2, 0.0)
         if self.count < 2:
             return np.zeros(self.dim, dtype=np.float64)
         return self._m2 / self.count
@@ -110,12 +173,24 @@ class RunningStandardizer:
                 f"got array with shape {arr.shape}"
             )
         arr = arr.astype(np.float64, copy=False)
-        # Chan et al. parallel/batch Welford: combine the running aggregate with
-        # the batch aggregate in one shot (numerically stable, order-independent).
         n_b = arr.shape[0]
         if n_b == 0:
             return
         mean_b = arr.mean(axis=0)
+        if self.ema_halflife > 0:
+            # EMA mode: fold this update's batch mean and raw second moment into
+            # the (bias-corrected) exponential moving averages. The half-life
+            # clock ticks once per UPDATE call (learn step), independent of the
+            # batch size; ``count`` still counts samples so the ``count == 0``
+            # identity and the learn-splice count contract are unchanged.
+            self._updates += 1
+            w = 1.0 - self._beta
+            self._ema_mean = self._beta * self._ema_mean + w * mean_b
+            self._ema_sq = self._beta * self._ema_sq + w * (arr ** 2).mean(axis=0)
+            self.count += n_b
+            return
+        # Chan et al. parallel/batch Welford: combine the running aggregate with
+        # the batch aggregate in one shot (numerically stable, order-independent).
         m2_b = ((arr - mean_b) ** 2).sum(axis=0)
         n_a = self.count
         if n_a == 0:
@@ -142,17 +217,20 @@ class RunningStandardizer:
         """
         if self.count == 0:
             return x
+        # self.mean / self.var dispatch on the mode (Welford vs bias-corrected
+        # EMA); in Welford mode they are the exact same values as before.
+        mean = self.mean
         if _is_torch(x):
             import torch as T
 
-            mean_t = T.as_tensor(self._mean, dtype=x.dtype, device=x.device)
+            mean_t = T.as_tensor(mean, dtype=x.dtype, device=x.device)
             std_t = T.as_tensor(
                 np.sqrt(self.var + self.eps), dtype=x.dtype, device=x.device
             )
             return (x - mean_t) / std_t
         arr = np.asarray(x, dtype=np.float32)
         std = np.sqrt(self.var + self.eps).astype(np.float32)
-        out = (arr - self._mean.astype(np.float32)) / std
+        out = (arr - mean.astype(np.float32)) / std
         return out.astype(np.float32, copy=False)
 
 

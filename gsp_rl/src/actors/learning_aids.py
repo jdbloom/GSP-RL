@@ -346,6 +346,21 @@ class Hyperparameters:
         self.gsp_e2e_normalize_feature = bool(
             config.get('GSP_E2E_NORMALIZE_FEATURE', False)
         )
+        # GSP_E2E_NORMALIZE_EMA_HALFLIFE (default 0 = OFF -> legacy all-history
+        # Welford, byte-identical to existing runs). When > 0, the
+        # RunningStandardizer tracks a bias-corrected exponential moving
+        # mean/variance whose per-batch weight halves every N UPDATE calls
+        # (learn steps), so the stats follow the RECENT feature distribution.
+        # Motivation (2026-07-09, live cells): at high GSP_E2E_LAMBDA (40000)
+        # the head's early outputs are large/noisy and permanently inflate the
+        # all-history running std — post-norm feature std reached only
+        # 0.17-0.39 instead of ~1.0, silently re-shrinking the feature the
+        # standardizer exists to normalize (defeats GSP_E2E_NORMALIZE_FEATURE).
+        # Only meaningful when GSP_E2E_NORMALIZE_FEATURE is on. A YAML null
+        # degrades to 0.0 via the `or`. See feature_stats.py for the numerics.
+        self.gsp_e2e_normalize_ema_halflife = float(
+            config.get('GSP_E2E_NORMALIZE_EMA_HALFLIFE', 0.0) or 0.0
+        )
         # Placeholder; Actor.__init__ overwrites with a RunningStandardizer(dim=K)
         # when the flag is on. Stays None when off → every splice byte-identical.
         self.gsp_feature_stats = None

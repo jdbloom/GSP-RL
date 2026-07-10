@@ -115,7 +115,12 @@ class Actor(NetworkAids):
         # None → both splices byte-identical to today.
         if getattr(self, 'gsp_e2e_normalize_feature', False):
             _feat_dim = int(self.gsp_network_output or 1)
-            self.gsp_feature_stats = RunningStandardizer(dim=_feat_dim)
+            self.gsp_feature_stats = RunningStandardizer(
+                dim=_feat_dim,
+                # 0 (default) = legacy all-history Welford; > 0 = EMA mode with
+                # that half-life in learn-step updates (see feature_stats.py).
+                ema_halflife=getattr(self, 'gsp_e2e_normalize_ema_halflife', 0.0),
+            )
 
         # Task 0 ablation knobs for the GSP head. Defaults preserve legacy behavior.
         # Read from the agent_config.yml so experiments can flip these per-job.
