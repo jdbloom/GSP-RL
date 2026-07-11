@@ -413,13 +413,27 @@ class Hyperparameters:
         self.gsp_e2e_unified_target_arith = bool(
             config.get('GSP_E2E_UNIFIED_TARGET_ARITH', False)
         )
+        # Single condition source for the CALLER's fail-loud startup line
+        # (RL-CT Main.py, same pattern as gsp_splice_advantage_engaged /
+        # batched_gsp_path_engaged): True iff an E2E run will actually route
+        # its Bellman target through the unified arithmetic. Exposed as an
+        # attribute because the `stelaris.learn` logger below has NO handler
+        # in production — RL-CT's run logger is `stelaris.<exp_name>` with
+        # propagate=False and logging.lastResort drops INFO — so the lines
+        # below are silently discarded on every real run (they surface only
+        # under pytest caplog). The authoritative per-run python.log line is
+        # emitted by Main.py, keyed on this attribute.
+        self.gsp_e2e_unified_arith_engaged = (
+            self.gsp_e2e_enabled and self.gsp_e2e_unified_target_arith
+        )
         # Fail-loud engaged-path assertion (one line per Actor construction,
         # only where the flag governs anything, i.e. E2E runs): state the
         # arithmetic the E2E TD target will actually use, with the stabilizer
         # values as consumed — grep it before trusting any IC-vs-E2E
-        # comparison under a REWARD_SCALE recipe.
+        # comparison under a REWARD_SCALE recipe. (Test-visible only; see the
+        # attribute comment above for why production runs rely on Main.py.)
         if self.gsp_e2e_enabled:
-            if self.gsp_e2e_unified_target_arith:
+            if self.gsp_e2e_unified_arith_engaged:
                 _learn_logger.info(
                     "GSP_E2E_UNIFIED_TARGET_ARITH: ENGAGED — E2E Q-target = "
                     "reward_scale(%s)*rewards + gamma(%s)*bootstrap, "

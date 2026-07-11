@@ -49,6 +49,32 @@ def test_flag_parses_true():
     assert aids.gsp_e2e_unified_target_arith is True
 
 
+def test_engaged_attr_true_when_e2e_and_flag():
+    """gsp_e2e_unified_arith_engaged is the single condition source RL-CT
+    Main.py keys its per-run python.log startup line on (the stelaris.learn
+    lines below never reach a handler in production)."""
+    cfg = dict(E2E_BASE_CONFIG)
+    cfg["GSP_E2E_UNIFIED_TARGET_ARITH"] = True
+    aids = NetworkAids(cfg)
+    assert aids.gsp_e2e_unified_arith_engaged is True
+
+
+def test_engaged_attr_false_by_default():
+    aids = NetworkAids(dict(E2E_BASE_CONFIG))  # E2E on, flag absent
+    assert aids.gsp_e2e_unified_arith_engaged is False
+
+
+def test_engaged_attr_false_without_e2e():
+    """The flag governs only learn_DDQN_e2e; on a non-E2E arm the attribute
+    must read False even with the raw flag set, so the caller's ENGAGED line
+    can never claim unified arithmetic on an IC arm."""
+    cfg = dict(E2E_BASE_CONFIG)
+    cfg["GSP_E2E_ENABLED"] = False
+    cfg["GSP_E2E_UNIFIED_TARGET_ARITH"] = True
+    aids = NetworkAids(cfg)
+    assert aids.gsp_e2e_unified_arith_engaged is False
+
+
 # --- 2. fail-loud startup line ----------------------------------------------
 
 def test_startup_line_engaged(caplog):
