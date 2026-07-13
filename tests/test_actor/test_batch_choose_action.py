@@ -59,11 +59,10 @@ class TestDDQNBatch:
 
         assert sequential == batched
 
-    def test_exploiting_step_consumes_single_gate_draw_and_goes_greedy(self, config):
-        """0 < epsilon < 1, a seed whose gate draw EXPLOITS: exactly ONE
-        np.random.random() gate draw, ZERO np.random.choice draws, then the
-        batched greedy actions — the exploit-branch RNG contract, pinned via
-        np.random state equality."""
+    def test_all_exploit_step_consumes_per_robot_gate_draws_and_goes_greedy(self, config):
+        """0 < epsilon < 1, a seed whose FOUR gate draws all EXPLOIT: exactly
+        R np.random.random() gate draws (one per robot — the #91 v2 contract),
+        ZERO np.random.choice draws, then the batched greedy actions."""
         config["EPSILON"] = 0.5
         actor = Actor(id=1, config=config, network="DDQN",
                       input_size=8, output_size=4, min_max_action=1, meta_param_size=1)
@@ -73,22 +72,54 @@ class TestDDQNBatch:
         # Greedy reference: the test=True path never touches np.random.
         greedy = actor.choose_actions_batch(observations, actor.networks, test=True)
 
-        np.random.seed(0)  # first np.random.random() = 0.5488... > 0.5
+        np.random.seed(0)  # first four np.random.random() draws all > 0.5
         batched = actor.choose_actions_batch(observations, actor.networks, test=False)
         state_after = np.random.get_state()
 
         np.random.seed(0)
-        gate = np.random.random()
-        assert gate > actor.epsilon  # seed sanity: this seed exploits
+        gates = [np.random.random() for _ in range(4)]
+        assert all(g > actor.epsilon for g in gates)  # seed sanity: all exploit
         expected_state = np.random.get_state()
 
-        # Exploiting step returns the batched greedy actions...
         assert batched == greedy
-        # ...and leaves np.random exactly one gate draw ahead: no
-        # np.random.choice was consumed anywhere in the call.
         assert state_after[0] == expected_state[0]
         np.testing.assert_array_equal(state_after[1], expected_state[1])
         assert state_after[2:] == expected_state[2:]
+
+    def test_mixed_step_np_random_stream_identical_to_sequential(self, config):
+        """#91 v2 acceptance gate: on a MIXED explore/exploit step, flag-on
+        actions AND the post-call np.random state both equal the sequential
+        choose_action loop's — the RNG stream is IDENTICAL, not just the same
+        draw count."""
+        config["EPSILON"] = 0.6
+        actor = Actor(id=1, config=config, network="DDQN",
+                      input_size=8, output_size=4, min_max_action=1, meta_param_size=1)
+        rng = np.random.default_rng(11)
+        observations = [rng.standard_normal(8).astype(np.float32) for _ in range(4)]
+
+        np.random.seed(0)
+        batched = actor.choose_actions_batch(observations, actor.networks, test=False)
+        state_batched = np.random.get_state()
+
+        np.random.seed(0)
+        sequential = [actor.choose_action(obs, actor.networks, test=False)
+                      for obs in observations]
+        state_sequential = np.random.get_state()
+
+        # Seed sanity: this seed/epsilon mixes both branches across the step.
+        np.random.seed(0)
+        exploits = []
+        for _ in range(4):
+            exploit = np.random.random() > actor.epsilon
+            exploits.append(exploit)
+            if not exploit:
+                np.random.choice(actor.action_space)
+        assert any(exploits) and not all(exploits)
+
+        assert batched == sequential
+        assert state_batched[0] == state_sequential[0]
+        np.testing.assert_array_equal(state_batched[1], state_sequential[1])
+        assert state_batched[2:] == state_sequential[2:]
 
 
 class TestDDPGBatch:
