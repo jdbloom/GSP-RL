@@ -12,9 +12,9 @@ choose_actions_batch call:
    so equality is allclose(atol=1e-6), never bit-exact by contract).
 3. Shape correctness across GSP output widths K (scalar delta_theta-style
    K=1, kinematics-style K=3, trajectory-style K=5): one (K,) row per robot.
-4. The exploring epsilon branch returns one valid discrete action per robot
-   from a SINGLE epsilon gate draw (the RNG-contract change that makes the
-   flag baseline-changing).
+4. The exploring epsilon branch draws one gate per robot, explorer choice
+   draws interleaved in robot order — the #91 v2 contract: the flag-on
+   np.random stream is IDENTICAL to the sequential loop.
 
 Complements tests/test_actor/test_batch_choose_action.py (April 2026, main
 action nets only) with the GSP-head coverage the #53-B call sites need.
@@ -73,8 +73,10 @@ class TestDDQNActingBatchContract:
         assert batched == sequential
         assert all(isinstance(a, int) for a in batched)
 
-    def test_exploring_branch_single_gate_draw(self):
-        """epsilon=1.0: every robot explores off ONE gate draw; all valid."""
+    def test_exploring_branch_per_robot_gate_draws(self):
+        """epsilon=1.0: every robot explores off its OWN gate draw, with the
+        explorer np.random.choice draws interleaved per robot in the exact
+        sequential order (#91 v2 RNG contract)."""
         actor = _make_gsp_actor(k=1)
         actor.epsilon = 1.0
         rng = np.random.default_rng(7)
@@ -83,10 +85,12 @@ class TestDDQNActingBatchContract:
         np.random.seed(123)
         batched = actor.choose_actions_batch(obs, actor.networks, test=False)
 
-        # One np.random.random() gate + 4 np.random.choice draws consumed.
+        # Sequential stream: gate_i then choice_i, per robot in order.
         np.random.seed(123)
-        _ = np.random.random()
-        expected = [np.random.choice(actor.action_space) for _ in range(4)]
+        expected = []
+        for _ in range(4):
+            _ = np.random.random()
+            expected.append(np.random.choice(actor.action_space))
 
         assert len(batched) == 4
         assert all(a in actor.action_space for a in batched)

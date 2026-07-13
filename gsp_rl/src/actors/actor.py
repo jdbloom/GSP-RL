@@ -693,8 +693,11 @@ class Actor(NetworkAids):
           - float-reduction order differs (batched vs per-row matmul), so
             outputs match sequential only within fp tolerance (~1e-6); on a
             near-tie the DQN/DDQN argmax can flip;
-          - the R per-robot epsilon-greedy gate draws collapse to ONE
-            np.random.random() draw per step (all-explore or all-exploit);
+          - (#91 v2) the DQN/DDQN epsilon gates + explorer action draws
+            replay the sequential per-robot np.random stream EXACTLY (gate_i,
+            then choice_i for explorers, in robot order); only the exploit
+            forwards are batched, so flag-on differs from sequential by
+            matmul float-reduction order alone;
           - DDPG exploration noise is drawn as one (R, K) T.normal instead of
             R sequential (1, K) draws (same count, different stream order).
         Activation is gated on the pre-registered n-seed noise-floor
@@ -727,10 +730,26 @@ class Actor(NetworkAids):
             list of actions, one per observation.
         """
         if networks['learning_scheme'] in {'DQN', 'DDQN'}:
-            if test or np.random.random() > self.epsilon:
+            if test:
                 return self.DQN_DDQN_choose_action_batch(observations, networks)
-            else:
-                return [np.random.choice(self.action_space) for _ in observations]
+            # #91 v2 RNG contract: replay the sequential per-robot np.random
+            # stream EXACTLY — for each robot in order, one epsilon-gate draw,
+            # then (explorers only) one np.random.choice draw — and batch only
+            # the exploit forwards. Flag-on differs from the sequential loop
+            # by matmul float-reduction order alone.
+            actions = [None] * len(observations)
+            exploit_idx = []
+            for i in range(len(observations)):
+                if np.random.random() > self.epsilon:
+                    exploit_idx.append(i)
+                else:
+                    actions[i] = np.random.choice(self.action_space)
+            if exploit_idx:
+                greedy = self.DQN_DDQN_choose_action_batch(
+                    [observations[i] for i in exploit_idx], networks)
+                for j, i in enumerate(exploit_idx):
+                    actions[i] = greedy[j]
+            return actions
         elif networks['learning_scheme'] == 'DDPG':
             actions = self.DDPG_choose_action_batch(observations, networks)
             if not test:
