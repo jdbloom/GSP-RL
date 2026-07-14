@@ -624,6 +624,12 @@ class Hyperparameters:
             'cyl_kinematics_goal_4d': 4,
             'time_to_goal_1d': 1,
             'neighbor_force_1d': 1,
+            # force_disagreement_1d: global directional-disagreement scalar of the
+            # applied forces, 1 - |Σf_i|/Σ|f_i| (0=aligned, ~1=fighting). Same value
+            # for every robot; non-redundant (a single robot can't infer the
+            # collective's misalignment from its own view) — the top-ranked
+            # in-setting target from the 2026-07-14 global-target sweep.
+            'force_disagreement_1d': 1,
             'delta_theta_traj': None,       # size == K == GSP_PREDICTION_HORIZON
             'goal_progress_traj': None,     # size == K
             'cyl_displacement_traj': None,  # size == 2K (per-step Δx,Δy pairs)
