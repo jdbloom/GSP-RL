@@ -535,9 +535,58 @@ class Actor(NetworkAids):
                 raise Exception('[Error] gsp learning scheme is not recognised: '+learning_scheme)
 
     def build_DDPG_gsp(self):
+        # Action-conditioned discrete-DDQN delta_theta_traj GSP head.
+        # When self.gsp_action_conditioned is True, the head's input width grows
+        # by gsp_action_cond_dim (the action encoding). The construction-time gate
+        # mirrors the advantage-splice gate at actor.py:~274 — it raises loudly
+        # unless the host scheme is DQN/DDQN, the target is delta_theta_traj, and
+        # JEPA/SF are off. self.gsp_action_conditioned_engaged is the single
+        # fail-loud condition source the RL-CT host reads for its startup line.
+        self.gsp_action_conditioned_engaged = False
+        _head_input = self.gsp_network_input
+        if getattr(self, 'gsp_action_conditioned', False):
+            _cond_dim = int(getattr(self, 'gsp_action_cond_dim', 0))
+            if _cond_dim <= 0:
+                raise ValueError(
+                    "GSP_ACTION_CONDITIONED is True but gsp_action_cond_dim is "
+                    f"{_cond_dim}. Set GSP_ACTION_COND_N (and optionally "
+                    "GSP_ACTION_COND_EMBED_DIM) to a positive integer."
+                )
+            # Construction-time gate: only DQN/DDQN + delta_theta_traj + no JEPA/SF.
+            _host_scheme = getattr(self, 'networks', {}).get('learning_scheme', '')
+            if _host_scheme not in ('DQN', 'DDQN'):
+                raise ValueError(
+                    "GSP_ACTION_CONDITIONED requires a discrete host scheme "
+                    f"(DQN/DDQN); got {_host_scheme!r}."
+                )
+            if not self.gsp:
+                raise ValueError(
+                    "GSP_ACTION_CONDITIONED is set but gsp=False."
+                )
+            _target = getattr(self, 'gsp_prediction_target', '')
+            _kind = getattr(self, 'gsp_output_kind', '')
+            if _target != 'delta_theta_traj' and _kind != 'delta_theta_traj':
+                raise ValueError(
+                    "GSP_ACTION_CONDITIONED requires GSP_PREDICTION_TARGET / "
+                    f"GSP_OUTPUT_KIND = 'delta_theta_traj'; got target={_target!r}, "
+                    f"kind={_kind!r}."
+                )
+            if getattr(self, 'gsp_jepa_enabled', False):
+                raise ValueError(
+                    "GSP_ACTION_CONDITIONED does not support the JEPA latent path "
+                    "(GSP_JEPA_ENABLED)."
+                )
+            if getattr(self, 'gsp_sf_enabled', False):
+                raise ValueError(
+                    "GSP_ACTION_CONDITIONED does not support the successor-features "
+                    "head (GSP_SF_ENABLED)."
+                )
+            _head_input += _cond_dim
+            self.gsp_action_conditioned_engaged = True
+
         actor_nn_args = {
             'id':self.id,
-            'input_size':self.gsp_network_input,
+            'input_size':_head_input,
             'output_size':self.gsp_network_output,
             # Phase 4: use gsp_head_lr (independent of trunk/actor LR).
             # Default: same as self.lr (from config['LR']), so existing batches are
@@ -569,11 +618,22 @@ class Actor(NetworkAids):
         }
         critic_nn_args = {
             'id':self.id,
-            'input_size':self.gsp_network_input+self.gsp_network_output,
+            'input_size':_head_input+self.gsp_network_output,
             'output_size': 1,
             'lr': self.lr
         }
-        return self.make_DDPG_networks(actor_nn_args, critic_nn_args)
+        gsp_nets = self.make_DDPG_networks(actor_nn_args, critic_nn_args)
+
+        # Action-conditioned embedding: when encoding is 'embedding', construct an
+        # nn.Embedding on the head. For 'onehot' no extra module is needed.
+        if getattr(self, 'gsp_action_conditioned', False) and self.gsp_action_cond_encoding == 'embedding':
+            _emb = nn.Embedding(
+                int(self.gsp_action_cond_n), int(self.gsp_action_cond_embed_dim)
+            )
+            # Store on the actor so predict_gsp_actions can find it.
+            gsp_nets['action_embedding'] = _emb
+
+        return gsp_nets
     
     def build_RDDPG_gsp(self):
         lstm_nn_args = {
@@ -675,6 +735,46 @@ class Actor(NetworkAids):
         else:
             raise Exception('[ERROR]: Learning scheme not recognised for action selection ' + networks['learning_scheme'])
     
+    def predict_gsp_actions(self, gsp_state, n_actions):
+        """Action-conditioned GSP forecast for ONE robot.
+
+        Given ONE robot's gsp_state (shape (gsp_network_input,)) and the action
+        count N, build the (N, gsp_network_input + gsp_action_cond_dim) stack of
+        action-augmented inputs, run ONE forward through the stateless dtraj head,
+        and return the (N, K) forecasts.
+
+        action_encoding: onehot(a, N) for 'onehot'; embedding(a) for 'embedding'.
+        This is a batched matmul over ACTIONS OF ONE ROBOT — it does NOT touch the
+        #53-B cross-robot BATCHED_ACTOR_FORWARD path or its epsilon-gate RNG
+        contract; do NOT route through choose_actions_batch.
+        """
+        if not getattr(self, 'gsp_action_conditioned', False):
+            raise RuntimeError(
+                "predict_gsp_actions called but GSP_ACTION_CONDITIONED is False."
+            )
+        _cond_dim = int(self.gsp_action_cond_dim)
+        _encoding = self.gsp_action_cond_encoding
+        _head = self.gsp_networks['actor']
+        _device = next(_head.parameters()).device
+
+        # Build the (N, input) stack.
+        _state_t = T.as_tensor(gsp_state, dtype=T.float32).to(_device)  # (D,)
+        _rows = []
+        for a in range(n_actions):
+            if _encoding == 'onehot':
+                _enc = F.one_hot(T.tensor(a, device=_device), num_classes=n_actions).float()
+            elif _encoding == 'embedding':
+                _emb = self.gsp_networks['action_embedding']
+                _enc = _emb(T.tensor(a, device=_device))
+            else:
+                raise ValueError(f"Unknown encoding {_encoding!r}")
+            _rows.append(T.cat([_state_t, _enc], dim=0))
+        _batch = T.stack(_rows, dim=0)  # (N, D + cond_dim)
+
+        with T.no_grad():
+            _preds = _head.forward(_batch)  # (N, K)
+        return _preds
+
     def choose_actions_batch(self, observations, networks, test=False):
         """Batched action selection for multiple observations in one forward pass.
 
