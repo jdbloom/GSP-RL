@@ -769,6 +769,26 @@ class Hyperparameters:
         #     cosine latent loss (SPR: raw-MSE is the catastrophic variant).
         self.gsp_jepa_cosine_loss = bool(config.get('GSP_JEPA_COSINE_LOSS', False))
 
+        # --- Action-conditioned discrete-DDQN delta_theta_traj GSP head ---
+        # Mirrors the JEPA action-cond pattern (GSP_JEPA_ACTION_COND) but applied
+        # to the proven dtraj DDPG-scheme head. Flag-gated, default OFF.
+        self.gsp_action_conditioned = bool(config.get('GSP_ACTION_CONDITIONED', False))
+        self.gsp_action_cond_encoding = str(config.get('GSP_ACTION_COND_ENCODING', 'onehot'))
+        self.gsp_action_cond_n = int(config.get('GSP_ACTION_COND_N', 0))
+        self.gsp_action_cond_embed_dim = int(config.get('GSP_ACTION_COND_EMBED_DIM', 0))
+        if self.gsp_action_conditioned:
+            if self.gsp_action_cond_encoding == 'onehot':
+                self.gsp_action_cond_dim = self.gsp_action_cond_n
+            elif self.gsp_action_cond_encoding == 'embedding':
+                self.gsp_action_cond_dim = self.gsp_action_cond_embed_dim
+            else:
+                raise ValueError(
+                    f"Unknown GSP_ACTION_COND_ENCODING '{self.gsp_action_cond_encoding}'. "
+                    "Valid: 'onehot', 'embedding'."
+                )
+        else:
+            self.gsp_action_cond_dim = 0
+
         # --- Latent-primary actor head (2026-07-06 pre-registration) ---
         # See docs/research/2026-07-06-latent-primary-actor-prereg.md (Stelaris).
         # Both default OFF so an existing GSP_JEPA_ENABLED / coupled run is
@@ -2106,6 +2126,21 @@ class NetworkAids(Hyperparameters):
         """
         if networks['replay'].mem_ctr < self.gsp_batch_size:
             return None
+
+        # Action-conditioned GSP head: the RL-CT store site augments the stored
+        # obs with the one-hot action, so the sampled gsp_obs width must equal
+        # gsp_network_input + gsp_action_cond_dim. Assert loudly so a store/head
+        # drift fires here, not as a silent shape-mismatch.
+        if getattr(self, 'gsp_action_conditioned', False):
+            _expected = int(self.gsp_network_input) + int(self.gsp_action_cond_dim)
+            _actual = networks['replay'].num_observations
+            assert _actual == _expected, (
+                f"GSP_ACTION_CONDITIONED: stored gsp_obs width {_actual} != "
+                f"gsp_network_input ({self.gsp_network_input}) + "
+                f"gsp_action_cond_dim ({self.gsp_action_cond_dim}) = {_expected}. "
+                "The RL-CT store site must augment the stored obs with the "
+                "action encoding."
+            )
 
         # Defensive: diagnostics put the actor in eval() and don't always
         # restore train(). cuDNN's RNN backward fails if the LSTM is in eval
