@@ -235,6 +235,13 @@ class Hyperparameters:
         self.epsilon = config['EPSILON']
         self.eps_min = config['EPS_MIN']
         self.eps_dec = config['EPS_DEC']
+        # EVAL_EPSILON: epsilon-greedy action noise injected ONLY at eval (test=True)
+        # for DQN/DDQN. Default 0.0 => eval stays pure-greedy, bit-exact with prior
+        # runs. >0 tests the noise-driven basin-escape hypothesis (whether uniform
+        # action noise lets a wedged transport cluster unstick). None coerces to 0.0
+        # (fail-loud: never `or`-default a valid 0.0).
+        _eval_eps = config.get('EVAL_EPSILON', 0.0)
+        self.eval_epsilon = float(0.0 if _eval_eps is None else _eval_eps)
 
         self.gsp_learning_offset = config['GSP_LEARNING_FREQUENCY'] #learn after every 1000 action network learning steps
         self.gsp_batch_size = config['GSP_BATCH_SIZE']

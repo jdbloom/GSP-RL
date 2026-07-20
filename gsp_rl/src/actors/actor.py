@@ -649,7 +649,13 @@ class Actor(NetworkAids):
  
     def choose_action(self, observation, networks, test=False):        
         if networks['learning_scheme'] in {'DQN', 'DDQN'}:
-            if test or np.random.random()>self.epsilon:
+            if test:
+                # eval: pure greedy unless EVAL_EPSILON>0 injects action noise
+                if self.eval_epsilon > 0 and np.random.random() < self.eval_epsilon:
+                    actions = np.random.choice(self.action_space)
+                else:
+                    actions = self.DQN_DDQN_choose_action(observation, networks)
+            elif np.random.random()>self.epsilon:
                 actions = self.DQN_DDQN_choose_action(observation, networks)
             else:
                 actions = np.random.choice(self.action_space)
