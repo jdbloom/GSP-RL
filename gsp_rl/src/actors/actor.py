@@ -647,6 +647,12 @@ class Actor(NetworkAids):
                     self.networks['q_eval'].state_dict()
                 )
  
+    def _greedy_or_boltzmann(self, observation, networks):
+        """Greedy argmax over Q, or a Boltzmann sample when BOLTZMANN_TEMPERATURE>0."""
+        if self.boltzmann_temperature > 0:
+            return self.boltzmann_action(observation, networks)
+        return self.DQN_DDQN_choose_action(observation, networks)
+
     def choose_action(self, observation, networks, test=False):        
         if networks['learning_scheme'] in {'DQN', 'DDQN'}:
             if test:
@@ -654,9 +660,9 @@ class Actor(NetworkAids):
                 if self.eval_epsilon > 0 and np.random.random() < self.eval_epsilon:
                     actions = np.random.choice(self.action_space)
                 else:
-                    actions = self.DQN_DDQN_choose_action(observation, networks)
+                    actions = self._greedy_or_boltzmann(observation, networks)
             elif np.random.random()>self.epsilon:
-                actions = self.DQN_DDQN_choose_action(observation, networks)
+                actions = self._greedy_or_boltzmann(observation, networks)
             else:
                 actions = np.random.choice(self.action_space)
             return actions
