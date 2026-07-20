@@ -41,6 +41,18 @@ import logging
 _learn_logger = logging.getLogger("stelaris.learn")
 
 
+def _head_should_update(learn_step_counter: int, update_every: int) -> bool:
+    """Return True when the GSP E2E head should take an optimizer step.
+
+    Pure helper — unit-testable without torch. When update_every <= 1 the head
+    updates every learn step (the default). When > 1, the head updates only on
+    steps where ``learn_step_counter % update_every == 0``.
+    """
+    if update_every <= 1:
+        return True
+    return learn_step_counter % update_every == 0
+
+
 def _check_nan(value, name):
     """Raise RuntimeError if value is NaN or Inf. Works with floats and tensors.
 
@@ -244,6 +256,8 @@ class Hyperparameters:
         self.eval_epsilon = float(0.0 if _eval_eps is None else _eval_eps)
 
         self.gsp_learning_offset = config['GSP_LEARNING_FREQUENCY'] #learn after every 1000 action network learning steps
+        _hue = config.get('GSP_E2E_HEAD_UPDATE_EVERY', 1)
+        self.gsp_e2e_head_update_every = int(1 if _hue is None else _hue)
         self.gsp_batch_size = config['GSP_BATCH_SIZE']
 
         self.batch_size = config['BATCH_SIZE']
@@ -1430,7 +1444,9 @@ class NetworkAids(Hyperparameters):
 
         # --- 8. Step both optimizers ---
         networks['q_eval'].optimizer.step()
-        gsp_networks['actor'].optimizer.step()
+        if _head_should_update(networks['learn_step_counter'],
+                               self.gsp_e2e_head_update_every):
+            gsp_networks['actor'].optimizer.step()
 
         networks['learn_step_counter'] += 1
         self.decrement_epsilon()
