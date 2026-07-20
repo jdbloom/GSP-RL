@@ -254,6 +254,11 @@ class Hyperparameters:
         # (fail-loud: never `or`-default a valid 0.0).
         _eval_eps = config.get('EVAL_EPSILON', 0.0)
         self.eval_epsilon = float(0.0 if _eval_eps is None else _eval_eps)
+        # BOLTZMANN_TEMPERATURE: >0 => sample action ~ softmax(Q/tau) at train+eval
+        # (the discrete-action SAC-analog; bakes in escape stochasticity). Default
+        # 0.0 => argmax greedy, bit-exact. None coerces to 0.0 (never or-default).
+        _bt = config.get('BOLTZMANN_TEMPERATURE', 0.0)
+        self.boltzmann_temperature = float(0.0 if _bt is None else _bt)
 
         self.gsp_learning_offset = config['GSP_LEARNING_FREQUENCY'] #learn after every 1000 action network learning steps
         _hue = config.get('GSP_E2E_HEAD_UPDATE_EVERY', 1)
@@ -973,6 +978,17 @@ class NetworkAids(Hyperparameters):
         state = T.tensor(observation, dtype = T.float).to(networks['q_eval'].device)
         action_values = networks['q_eval'].forward(state)
         return T.argmax(action_values).item()
+
+    def boltzmann_action(self, observation, networks):
+        """Sample an action ~ softmax(Q(s,.)/tau) over the discrete action space.
+        Same Q-forward as DQN_DDQN_choose_action; numerically-stable softmax."""
+        state = T.tensor(observation, dtype=T.float).to(networks['q_eval'].device)
+        q = networks['q_eval'].forward(state).detach().cpu().numpy().ravel()
+        z = q / self.boltzmann_temperature
+        z = z - np.max(z)
+        p = np.exp(z)
+        p = p / p.sum()
+        return int(np.random.choice(self.action_space, p=p))
 
     def DQN_DDQN_choose_action_batch(self, observations, networks):
         """Batched action selection for DQN/DDQN. Returns list of action indices."""
